@@ -50,6 +50,9 @@
             font-size: 1rem;
             transition: opacity 0.3s;
             cursor: pointer;
+            background: none;
+            border: none;
+            font-family: inherit;
         }
 
         nav a:hover {
@@ -457,9 +460,9 @@
     <nav>
         <div class="logo">ISCA-k Beta</div>
         <ul>
-            <li><a onclick="showPage('home')">HOME</a></li>
-            <li><a onclick="showPage('about')">ABOUT</a></li>
-            <li><a onclick="showPage('imputation')">IMPUTATION</a></li>
+            <li><a onclick="event.preventDefault(); showPage('home')">HOME</a></li>
+            <li><a onclick="event.preventDefault(); showPage('about')">ABOUT</a></li>
+            <li><a onclick="event.preventDefault(); showPage('imputation')">IMPUTATION</a></li>
         </ul>
     </nav>
 
@@ -469,8 +472,8 @@
             <h1>ISCA-k</h1>
             <p>Advanced missing values imputation using Information-theoretic Smart Collaborative Approach</p>
             <div class="cta-buttons">
-                <button class="btn btn-primary" onclick="showPage('imputation')">Get Started</button>
-                <button class="btn btn-secondary" onclick="showPage('about')">Learn More</button>
+                <button class="btn btn-primary" onclick="event.preventDefault(); showPage('imputation')">Get Started</button>
+                <button class="btn btn-secondary" onclick="event.preventDefault(); showPage('about')">Learn More</button>
             </div>
         </div>
     </div>
@@ -478,25 +481,21 @@
     <!-- About Page -->
     <div id="about" class="page">
         <div class="content-container">
-            <h1>About ISCA-k</h1>
+            <h1>About This Project</h1>
             <p>
-                ISCA-k (Information-theoretic Smart Collaborative Approach with adaptive k) is a novel method for missing data imputation that combines information theory with collaborative filtering techniques.
+                Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.
             </p>
             <p>
-                Unlike traditional methods, ISCA-k adapts to your data's characteristics, automatically selecting the optimal number of neighbors (k) based on local data density and using mutual information to weight feature importance.
+                Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
             </p>
             <p>
-                This beta test allows you to try ISCA-k alongside traditional methods like kNN, MICE, and MissForest on your own datasets. All processing happens in your browser - your data never leaves your device.
+                Sed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo.
             </p>
             <p>
-                <strong>Key Features:</strong>
+                Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet, consectetur, adipisci velit.
             </p>
             <p>
-                ✓ Automatic type detection (numeric, binary, nominal, ordinal)<br>
-                ✓ Adaptive k selection based on data density<br>
-                ✓ MI-weighted feature importance<br>
-                ✓ Handles mixed-type datasets<br>
-                ✓ Privacy-first: client-side processing
+                At vero eos et accusamus et iusto odio dignissimos ducimus qui blanditiis praesentium voluptatum deleniti atque corrupti quos dolores et quas molestias excepturi sint occaecati cupiditate non provident, similique sunt in culpa qui officia deserunt mollitia animi.
             </p>
         </div>
     </div>
