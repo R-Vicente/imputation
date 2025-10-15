@@ -781,9 +781,9 @@ from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
 
-# Load CSV
+# Load CSV - treat common missing value representations
 csv_data = """${uploadedData}"""
-df = pd.read_csv(StringIO(csv_data))
+df = pd.read_csv(StringIO(csv_data), na_values=['', ' ', 'NA', 'N/A', 'na', 'n/a', 'NaN', 'nan', 'NULL', 'null', '?', '-'])
 
 print(f"Dataset shape: {df.shape}")
 print(f"Missing values: {df.isnull().sum().sum()}")
