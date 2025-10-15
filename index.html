@@ -85,51 +85,14 @@
             margin-bottom: 1rem;
             text-transform: uppercase;
             letter-spacing: 3px;
+            line-height: 1.2;
         }
 
         .hero-content p {
             font-size: 1.3rem;
-            margin-bottom: 3rem;
+            margin-bottom: 0;
             opacity: 0.9;
             max-width: 600px;
-        }
-
-        .cta-buttons {
-            display: flex;
-            gap: 1.5rem;
-        }
-
-        .btn {
-            padding: 1rem 2.5rem;
-            font-size: 1rem;
-            border: none;
-            border-radius: 50px;
-            cursor: pointer;
-            transition: all 0.3s;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-
-        .btn-primary {
-            background: white;
-            color: #667eea;
-        }
-
-        .btn-primary:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
-        }
-
-        .btn-secondary {
-            background: transparent;
-            color: white;
-            border: 2px solid white;
-        }
-
-        .btn-secondary:hover {
-            background: white;
-            color: #667eea;
         }
 
         /* About Page */
@@ -460,21 +423,17 @@
     <nav>
         <div class="logo">ISCA-k Beta</div>
         <ul>
-            <li><a onclick="event.preventDefault(); showPage('home')">HOME</a></li>
-            <li><a onclick="event.preventDefault(); showPage('about')">ABOUT</a></li>
-            <li><a onclick="event.preventDefault(); showPage('imputation')">IMPUTATION</a></li>
+            <li><a href="#home" onclick="showPage('home'); return false;">HOME</a></li>
+            <li><a href="#about" onclick="showPage('about'); return false;">ABOUT</a></li>
+            <li><a href="#imputation" onclick="showPage('imputation'); return false;">IMPUTATION</a></li>
         </ul>
     </nav>
 
     <!-- Home Page -->
     <div id="home" class="page active">
         <div class="hero-content">
-            <h1>ISCA-k</h1>
-            <p>Advanced missing values imputation using Information-theoretic Smart Collaborative Approach</p>
-            <div class="cta-buttons">
-                <button class="btn btn-primary" onclick="event.preventDefault(); showPage('imputation')">Get Started</button>
-                <button class="btn btn-secondary" onclick="event.preventDefault(); showPage('about')">Learn More</button>
-            </div>
+            <h1>GRADIENT<br>ABSTRACT DESIGN</h1>
+            <p>Landing Page Template</p>
         </div>
     </div>
 
