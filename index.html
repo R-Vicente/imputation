@@ -772,6 +772,10 @@
             showLoading('Running ' + selectedMethod.toUpperCase() + ' imputation...', 'Processing your dataset');
 
             try {
+                // Store CSV in pyodide namespace
+                pyodide.globals.set('csv_data', uploadedData);
+
+                // Load and check data
                 await pyodide.runPythonAsync(`
 import pandas as pd
 import numpy as np
@@ -779,121 +783,117 @@ from io import StringIO
 from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
-from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+from sklearn.ensemble import RandomForestRegressor
 
-# Load CSV - treat common missing value representations
-csv_data = """${uploadedData}"""
-df = pd.read_csv(StringIO(csv_data), na_values=['', ' ', 'NA', 'N/A', 'na', 'n/a', 'NaN', 'nan', 'NULL', 'null', '?', '-'])
+# Load CSV with proper missing value handling
+df = pd.read_csv(StringIO(csv_data), keep_default_na=True, na_values=['', ' ', 'NA', 'N/A', 'na', 'n/a', 'NaN', 'nan', 'NULL', 'null', '?', '-', 'None'])
 
-print(f"Dataset shape: {df.shape}")
-print(f"Missing values: {df.isnull().sum().sum()}")
+initial_missing = df.isnull().sum().sum()
+print(f"Loaded dataset: {df.shape[0]} rows x {df.shape[1]} cols")
+print(f"Initial missing values: {initial_missing}")
                 `);
 
                 let pythonCode = '';
 
                 if (selectedMethod === 'iscak') {
-                    // For now, use advanced kNN as placeholder until we implement full ISCA-k
                     const minFriends = document.getElementById('minFriends').value;
                     const maxFriends = document.getElementById('maxFriends').value;
                     pythonCode = `
-# ISCA-k (simplified version using adaptive kNN)
+# ISCA-k simplified (adaptive kNN)
 k_value = min(${maxFriends}, max(${minFriends}, int(len(df) * 0.1)))
-imputer = KNNImputer(n_neighbors=k_value, weights='distance')
-df_numeric = df.select_dtypes(include=[np.number])
-df_non_numeric = df.select_dtypes(exclude=[np.number])
+k_value = max(1, min(k_value, len(df) - 1))
 
-if not df_numeric.empty:
-    df_numeric_imputed = pd.DataFrame(imputer.fit_transform(df_numeric), 
-                                      columns=df_numeric.columns, 
-                                      index=df_numeric.index)
-else:
-    df_numeric_imputed = df_numeric
+df_imputed = df.copy()
 
-if not df_non_numeric.empty:
-    for col in df_non_numeric.columns:
-        df_non_numeric[col].fillna(df_non_numeric[col].mode()[0] if len(df_non_numeric[col].mode()) > 0 else 'missing', inplace=True)
+# Numeric columns
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+if numeric_cols and df[numeric_cols].isnull().sum().sum() > 0:
+    imputer = KNNImputer(n_neighbors=k_value, weights='distance')
+    df_imputed[numeric_cols] = imputer.fit_transform(df[numeric_cols])
 
-df_imputed = pd.concat([df_numeric_imputed, df_non_numeric], axis=1)
-df_imputed = df_imputed[df.columns]  # Restore original column order
-                    `;
+# Categorical columns
+cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+for col in cat_cols:
+    if df_imputed[col].isnull().sum() > 0:
+        mode_val = df_imputed[col].mode()
+        if len(mode_val) > 0:
+            df_imputed[col].fillna(mode_val[0], inplace=True)
+`;
                 } else if (selectedMethod === 'knn') {
                     const k = document.getElementById('knnK').value;
                     pythonCode = `
 # kNN Imputation
-imputer = KNNImputer(n_neighbors=${k}, weights='uniform')
-df_numeric = df.select_dtypes(include=[np.number])
-df_non_numeric = df.select_dtypes(exclude=[np.number])
+k_value = max(1, min(${k}, len(df) - 1))
 
-if not df_numeric.empty:
-    df_numeric_imputed = pd.DataFrame(imputer.fit_transform(df_numeric), 
-                                      columns=df_numeric.columns, 
-                                      index=df_numeric.index)
-else:
-    df_numeric_imputed = df_numeric
+df_imputed = df.copy()
 
-if not df_non_numeric.empty:
-    for col in df_non_numeric.columns:
-        df_non_numeric[col].fillna(df_non_numeric[col].mode()[0] if len(df_non_numeric[col].mode()) > 0 else 'missing', inplace=True)
+# Numeric columns
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+if numeric_cols and df[numeric_cols].isnull().sum().sum() > 0:
+    imputer = KNNImputer(n_neighbors=k_value, weights='uniform')
+    df_imputed[numeric_cols] = imputer.fit_transform(df[numeric_cols])
 
-df_imputed = pd.concat([df_numeric_imputed, df_non_numeric], axis=1)
-df_imputed = df_imputed[df.columns]
-                    `;
+# Categorical columns
+cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+for col in cat_cols:
+    if df_imputed[col].isnull().sum() > 0:
+        mode_val = df_imputed[col].mode()
+        if len(mode_val) > 0:
+            df_imputed[col].fillna(mode_val[0], inplace=True)
+`;
                 } else if (selectedMethod === 'mice') {
                     const maxIter = document.getElementById('miceMaxIter').value;
                     const randomState = document.getElementById('miceRandomState').value;
                     pythonCode = `
 # MICE Imputation
-imputer = IterativeImputer(max_iter=${maxIter}, random_state=${randomState})
-df_numeric = df.select_dtypes(include=[np.number])
-df_non_numeric = df.select_dtypes(exclude=[np.number])
+df_imputed = df.copy()
 
-if not df_numeric.empty:
-    df_numeric_imputed = pd.DataFrame(imputer.fit_transform(df_numeric), 
-                                      columns=df_numeric.columns, 
-                                      index=df_numeric.index)
-else:
-    df_numeric_imputed = df_numeric
+# Numeric columns
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+if numeric_cols and df[numeric_cols].isnull().sum().sum() > 0:
+    imputer = IterativeImputer(max_iter=${maxIter}, random_state=${randomState})
+    df_imputed[numeric_cols] = imputer.fit_transform(df[numeric_cols])
 
-if not df_non_numeric.empty:
-    for col in df_non_numeric.columns:
-        df_non_numeric[col].fillna(df_non_numeric[col].mode()[0] if len(df_non_numeric[col].mode()) > 0 else 'missing', inplace=True)
-
-df_imputed = pd.concat([df_numeric_imputed, df_non_numeric], axis=1)
-df_imputed = df_imputed[df.columns]
-                    `;
+# Categorical columns
+cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+for col in cat_cols:
+    if df_imputed[col].isnull().sum() > 0:
+        mode_val = df_imputed[col].mode()
+        if len(mode_val) > 0:
+            df_imputed[col].fillna(mode_val[0], inplace=True)
+`;
                 } else if (selectedMethod === 'missforest') {
                     const maxIter = document.getElementById('mfMaxIter').value;
                     const nTrees = document.getElementById('mfNTrees').value;
                     const randomState = document.getElementById('mfRandomState').value;
                     pythonCode = `
 # MissForest Imputation
-rf_estimator = RandomForestRegressor(n_estimators=${nTrees}, random_state=${randomState}, n_jobs=-1)
-imputer = IterativeImputer(estimator=rf_estimator, max_iter=${maxIter}, random_state=${randomState})
-df_numeric = df.select_dtypes(include=[np.number])
-df_non_numeric = df.select_dtypes(exclude=[np.number])
+rf_estimator = RandomForestRegressor(n_estimators=${nTrees}, random_state=${randomState}, n_jobs=1)
 
-if not df_numeric.empty:
-    df_numeric_imputed = pd.DataFrame(imputer.fit_transform(df_numeric), 
-                                      columns=df_numeric.columns, 
-                                      index=df_numeric.index)
-else:
-    df_numeric_imputed = df_numeric
+df_imputed = df.copy()
 
-if not df_non_numeric.empty:
-    for col in df_non_numeric.columns:
-        df_non_numeric[col].fillna(df_non_numeric[col].mode()[0] if len(df_non_numeric[col].mode()) > 0 else 'missing', inplace=True)
+# Numeric columns
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+if numeric_cols and df[numeric_cols].isnull().sum().sum() > 0:
+    imputer = IterativeImputer(estimator=rf_estimator, max_iter=${maxIter}, random_state=${randomState})
+    df_imputed[numeric_cols] = imputer.fit_transform(df[numeric_cols])
 
-df_imputed = pd.concat([df_numeric_imputed, df_non_numeric], axis=1)
-df_imputed = df_imputed[df.columns]
-                    `;
+# Categorical columns
+cat_cols = df.select_dtypes(exclude=[np.number]).columns.tolist()
+for col in cat_cols:
+    if df_imputed[col].isnull().sum() > 0:
+        mode_val = df_imputed[col].mode()
+        if len(mode_val) > 0:
+            df_imputed[col].fillna(mode_val[0], inplace=True)
+`;
                 }
 
                 await pyodide.runPythonAsync(pythonCode);
 
                 // Get results
-                const result = await pyodide.runPythonAsync(`
-# Calculate statistics
-initial_missing = df.isnull().sum().sum()
+                const statsJson = await pyodide.runPythonAsync(`
+import json
+
 final_missing = df_imputed.isnull().sum().sum()
 imputation_rate = ((initial_missing - final_missing) / initial_missing * 100) if initial_missing > 0 else 100
 
@@ -901,27 +901,25 @@ stats = {
     'initial_missing': int(initial_missing),
     'final_missing': int(final_missing),
     'imputation_rate': float(imputation_rate),
-    'shape': df.shape
+    'rows': int(df.shape[0]),
+    'cols': int(df.shape[1])
 }
 
-# Convert to CSV
-result_csv = df_imputed.to_csv(index=False)
-
-import json
-json.dumps({'stats': stats, 'csv': result_csv})
+json.dumps(stats)
                 `);
 
-                const resultData = JSON.parse(result);
-                imputedData = resultData.csv;
+                const stats = JSON.parse(statsJson);
+
+                // Get CSV
+                imputedData = await pyodide.runPythonAsync(`df_imputed.to_csv(index=False)`);
 
                 // Display results
-                const stats = resultData.stats;
                 document.getElementById('resultStats').innerHTML = `
-                    <p><strong>Original dataset:</strong> ${stats.shape[0]} rows × ${stats.shape[1]} columns</p>
+                    <p><strong>Original dataset:</strong> ${stats.rows} rows × ${stats.cols} columns</p>
                     <p><strong>Initial missing values:</strong> ${stats.initial_missing}</p>
                     <p><strong>Final missing values:</strong> ${stats.final_missing}</p>
                     <p><strong>Imputation rate:</strong> ${stats.imputation_rate.toFixed(2)}%</p>
-                    ${stats.final_missing === 0 ? '<p style="color: #10b981; font-weight: bold;">✓ Dataset 100% complete!</p>' : ''}
+                    ${stats.final_missing === 0 ? '<p style="color: #10b981; font-weight: bold;">✓ Dataset 100% complete!</p>' : '<p style="color: #f59e0b; font-weight: bold;">⚠ Some missing values remain</p>'}
                 `;
 
                 document.getElementById('resultSection').style.display = 'block';
