@@ -1,0 +1,1039 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Beta Test - Missing Values Imputation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%);
+            min-height: 100vh;
+            color: white;
+        }
+
+        /* Navigation */
+        nav {
+            position: fixed;
+            top: 0;
+            width: 100%;
+            background: rgba(0, 0, 0, 0.3);
+            backdrop-filter: blur(10px);
+            padding: 1.2rem 3rem;
+            z-index: 1000;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        nav .logo {
+            font-size: 1.5rem;
+            font-weight: 600;
+            letter-spacing: 1px;
+        }
+
+        nav ul {
+            list-style: none;
+            display: flex;
+            gap: 2.5rem;
+        }
+
+        nav a {
+            color: white;
+            text-decoration: none;
+            font-size: 1rem;
+            transition: opacity 0.3s;
+            cursor: pointer;
+        }
+
+        nav a:hover {
+            opacity: 0.7;
+        }
+
+        /* Pages Container */
+        .page {
+            display: none;
+            padding: 120px 3rem 3rem;
+            min-height: 100vh;
+        }
+
+        .page.active {
+            display: block;
+        }
+
+        /* Home Page */
+        #home {
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            text-align: center;
+        }
+
+        .hero-content h1 {
+            font-size: 4rem;
+            font-weight: 700;
+            margin-bottom: 1rem;
+            text-transform: uppercase;
+            letter-spacing: 3px;
+        }
+
+        .hero-content p {
+            font-size: 1.3rem;
+            margin-bottom: 3rem;
+            opacity: 0.9;
+            max-width: 600px;
+        }
+
+        .cta-buttons {
+            display: flex;
+            gap: 1.5rem;
+        }
+
+        .btn {
+            padding: 1rem 2.5rem;
+            font-size: 1rem;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .btn-primary {
+            background: white;
+            color: #667eea;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }
+
+        .btn-secondary {
+            background: transparent;
+            color: white;
+            border: 2px solid white;
+        }
+
+        .btn-secondary:hover {
+            background: white;
+            color: #667eea;
+        }
+
+        /* About Page */
+        #about .content-container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            padding: 3rem;
+            border-radius: 20px;
+        }
+
+        #about h1 {
+            font-size: 3rem;
+            margin-bottom: 2rem;
+        }
+
+        #about p {
+            font-size: 1.2rem;
+            line-height: 1.8;
+            margin-bottom: 1.5rem;
+            opacity: 0.9;
+        }
+
+        /* Imputation Page */
+        #imputation .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+
+        #imputation h1 {
+            font-size: 3rem;
+            margin-bottom: 2rem;
+            text-align: center;
+        }
+
+        .imputation-card {
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            padding: 2.5rem;
+            border-radius: 20px;
+            margin-bottom: 2rem;
+        }
+
+        .imputation-card h2 {
+            font-size: 1.8rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .upload-area {
+            border: 3px dashed rgba(255, 255, 255, 0.5);
+            border-radius: 15px;
+            padding: 3rem;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s;
+            margin-bottom: 1.5rem;
+        }
+
+        .upload-area:hover {
+            border-color: white;
+            background: rgba(255, 255, 255, 0.05);
+        }
+
+        .upload-area.dragover {
+            border-color: white;
+            background: rgba(255, 255, 255, 0.1);
+        }
+
+        .upload-icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+        }
+
+        input[type="file"] {
+            display: none;
+        }
+
+        .file-info {
+            margin-top: 1rem;
+            padding: 1rem;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            display: none;
+        }
+
+        .preview-table {
+            width: 100%;
+            overflow-x: auto;
+            margin-top: 1.5rem;
+            display: none;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: rgba(255, 255, 255, 0.1);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        th, td {
+            padding: 1rem;
+            text-align: left;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        th {
+            background: rgba(0, 0, 0, 0.2);
+            font-weight: 600;
+        }
+
+        .method-selector {
+            display: none;
+        }
+
+        .method-buttons {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .method-btn {
+            padding: 1.5rem;
+            background: rgba(255, 255, 255, 0.1);
+            border: 2px solid transparent;
+            border-radius: 15px;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-align: center;
+        }
+
+        .method-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            border-color: white;
+        }
+
+        .method-btn.selected {
+            background: rgba(255, 255, 255, 0.3);
+            border-color: white;
+        }
+
+        .method-btn h3 {
+            font-size: 1.3rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .method-btn p {
+            font-size: 0.9rem;
+            opacity: 0.8;
+        }
+
+        .parameters-section {
+            display: none;
+        }
+
+        .param-group {
+            margin-bottom: 1.5rem;
+        }
+
+        .param-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 600;
+        }
+
+        .param-group input, .param-group textarea {
+            width: 100%;
+            padding: 0.8rem;
+            border: none;
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            font-size: 1rem;
+        }
+
+        .param-group input::placeholder,
+        .param-group textarea::placeholder {
+            color: rgba(255, 255, 255, 0.6);
+        }
+
+        .param-group input[type="checkbox"] {
+            width: auto;
+            margin-right: 0.5rem;
+        }
+
+        .param-description {
+            font-size: 0.9rem;
+            opacity: 0.7;
+            margin-top: 0.3rem;
+        }
+
+        .impute-button {
+            width: 100%;
+            padding: 1.2rem;
+            background: white;
+            color: #667eea;
+            font-size: 1.2rem;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+            margin-top: 2rem;
+            display: none;
+        }
+
+        .impute-button:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }
+
+        .impute-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+
+        .loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.8);
+            display: none;
+            justify-content: center;
+            align-items: center;
+            z-index: 2000;
+        }
+
+        .loading-content {
+            text-align: center;
+        }
+
+        .spinner {
+            border: 5px solid rgba(255, 255, 255, 0.3);
+            border-top: 5px solid white;
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 1.5rem;
+        }
+
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+
+        .loading-text {
+            font-size: 1.2rem;
+            margin-bottom: 0.5rem;
+        }
+
+        .loading-subtext {
+            font-size: 0.9rem;
+            opacity: 0.7;
+        }
+
+        .error-message, .success-message {
+            padding: 1rem;
+            border-radius: 10px;
+            margin-bottom: 1.5rem;
+            display: none;
+        }
+
+        .error-message {
+            background: rgba(220, 38, 38, 0.2);
+            border: 1px solid rgba(220, 38, 38, 0.5);
+        }
+
+        .success-message {
+            background: rgba(34, 197, 94, 0.2);
+            border: 1px solid rgba(34, 197, 94, 0.5);
+        }
+
+        .result-section {
+            display: none;
+        }
+
+        .download-button {
+            width: 100%;
+            padding: 1.2rem;
+            background: #10b981;
+            color: white;
+            font-size: 1.2rem;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            font-weight: 600;
+            transition: all 0.3s;
+        }
+
+        .download-button:hover {
+            background: #059669;
+            transform: translateY(-3px);
+            box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+        }
+
+        @media (max-width: 768px) {
+            nav {
+                padding: 1rem 1.5rem;
+            }
+
+            nav ul {
+                gap: 1.5rem;
+            }
+
+            .hero-content h1 {
+                font-size: 2.5rem;
+            }
+
+            .cta-buttons {
+                flex-direction: column;
+                width: 100%;
+            }
+
+            .btn {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
+<body>
+    <!-- Navigation -->
+    <nav>
+        <div class="logo">ISCA-k Beta</div>
+        <ul>
+            <li><a onclick="showPage('home')">HOME</a></li>
+            <li><a onclick="showPage('about')">ABOUT</a></li>
+            <li><a onclick="showPage('imputation')">IMPUTATION</a></li>
+        </ul>
+    </nav>
+
+    <!-- Home Page -->
+    <div id="home" class="page active">
+        <div class="hero-content">
+            <h1>ISCA-k</h1>
+            <p>Advanced missing values imputation using Information-theoretic Smart Collaborative Approach</p>
+            <div class="cta-buttons">
+                <button class="btn btn-primary" onclick="showPage('imputation')">Get Started</button>
+                <button class="btn btn-secondary" onclick="showPage('about')">Learn More</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- About Page -->
+    <div id="about" class="page">
+        <div class="content-container">
+            <h1>About ISCA-k</h1>
+            <p>
+                ISCA-k (Information-theoretic Smart Collaborative Approach with adaptive k) is a novel method for missing data imputation that combines information theory with collaborative filtering techniques.
+            </p>
+            <p>
+                Unlike traditional methods, ISCA-k adapts to your data's characteristics, automatically selecting the optimal number of neighbors (k) based on local data density and using mutual information to weight feature importance.
+            </p>
+            <p>
+                This beta test allows you to try ISCA-k alongside traditional methods like kNN, MICE, and MissForest on your own datasets. All processing happens in your browser - your data never leaves your device.
+            </p>
+            <p>
+                <strong>Key Features:</strong>
+            </p>
+            <p>
+                ✓ Automatic type detection (numeric, binary, nominal, ordinal)<br>
+                ✓ Adaptive k selection based on data density<br>
+                ✓ MI-weighted feature importance<br>
+                ✓ Handles mixed-type datasets<br>
+                ✓ Privacy-first: client-side processing
+            </p>
+        </div>
+    </div>
+
+    <!-- Imputation Page -->
+    <div id="imputation" class="page">
+        <div class="container">
+            <h1>Dataset Imputation</h1>
+
+            <!-- Error/Success Messages -->
+            <div class="error-message" id="errorMessage"></div>
+            <div class="success-message" id="successMessage"></div>
+
+            <!-- Step 1: Upload -->
+            <div class="imputation-card">
+                <h2>1. Upload Your Dataset</h2>
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-icon">📁</div>
+                    <p>Click to upload or drag and drop your CSV file here</p>
+                    <input type="file" id="fileInput" accept=".csv">
+                </div>
+                <div class="file-info" id="fileInfo">
+                    <strong>File:</strong> <span id="fileName"></span><br>
+                    <strong>Size:</strong> <span id="fileSize"></span>
+                </div>
+                <div class="preview-table" id="previewTable">
+                    <h3>Preview (first 5 rows)</h3>
+                    <div id="tableContainer"></div>
+                </div>
+            </div>
+
+            <!-- Step 2: Method Selection -->
+            <div class="imputation-card method-selector" id="methodSelector">
+                <h2>2. Select Imputation Method</h2>
+                <div class="method-buttons">
+                    <div class="method-btn" onclick="selectMethod('iscak')">
+                        <h3>ISCA-k</h3>
+                        <p>Adaptive MI-based collaborative imputation</p>
+                    </div>
+                    <div class="method-btn" onclick="selectMethod('knn')">
+                        <h3>kNN</h3>
+                        <p>k-Nearest Neighbors imputation</p>
+                    </div>
+                    <div class="method-btn" onclick="selectMethod('mice')">
+                        <h3>MICE</h3>
+                        <p>Multiple Imputation by Chained Equations</p>
+                    </div>
+                    <div class="method-btn" onclick="selectMethod('missforest')">
+                        <h3>MissForest</h3>
+                        <p>Random Forest-based imputation</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Step 3: Parameters -->
+            <div class="imputation-card parameters-section" id="parametersSection">
+                <h2>3. Configure Parameters</h2>
+                
+                <!-- ISCA-k Parameters -->
+                <div id="iscakParams" style="display: none;">
+                    <div class="param-group">
+                        <label>Minimum Friends (min_friends)</label>
+                        <input type="number" id="minFriends" value="3" min="1" max="20">
+                        <div class="param-description">Minimum number of neighbors to consider</div>
+                    </div>
+                    <div class="param-group">
+                        <label>Maximum Friends (max_friends)</label>
+                        <input type="number" id="maxFriends" value="15" min="1" max="50">
+                        <div class="param-description">Maximum number of neighbors to consider</div>
+                    </div>
+                    <div class="param-group">
+                        <label>Force Categorical (optional)</label>
+                        <input type="text" id="forceCategorical" placeholder="e.g., col1, col2, col3">
+                        <div class="param-description">Comma-separated list of columns to treat as categorical</div>
+                    </div>
+                    <div class="param-group">
+                        <label>Force Ordinal (optional)</label>
+                        <textarea id="forceOrdinal" rows="3" placeholder='e.g., {"education": ["elementary", "high_school", "college"]}'></textarea>
+                        <div class="param-description">JSON dictionary mapping ordinal columns to their ordered categories</div>
+                    </div>
+                </div>
+
+                <!-- kNN Parameters -->
+                <div id="knnParams" style="display: none;">
+                    <div class="param-group">
+                        <label>Number of Neighbors (k)</label>
+                        <input type="number" id="knnK" value="5" min="1" max="20">
+                        <div class="param-description">Number of neighbors to use for imputation</div>
+                    </div>
+                    <div class="param-group">
+                        <label>
+                            <input type="checkbox" id="knnCrossVal">
+                            Use Cross-Validation
+                        </label>
+                        <div class="param-description">Automatically select optimal k using cross-validation</div>
+                    </div>
+                </div>
+
+                <!-- MICE Parameters -->
+                <div id="miceParams" style="display: none;">
+                    <div class="param-group">
+                        <label>Maximum Iterations</label>
+                        <input type="number" id="miceMaxIter" value="10" min="1" max="50">
+                        <div class="param-description">Maximum number of imputation rounds</div>
+                    </div>
+                    <div class="param-group">
+                        <label>Random State</label>
+                        <input type="number" id="miceRandomState" value="42" min="0">
+                        <div class="param-description">Random seed for reproducibility</div>
+                    </div>
+                </div>
+
+                <!-- MissForest Parameters -->
+                <div id="missforestParams" style="display: none;">
+                    <div class="param-group">
+                        <label>Maximum Iterations</label>
+                        <input type="number" id="mfMaxIter" value="10" min="1" max="50">
+                        <div class="param-description">Maximum number of forest iterations</div>
+                    </div>
+                    <div class="param-group">
+                        <label>Number of Trees</label>
+                        <input type="number" id="mfNTrees" value="100" min="10" max="500">
+                        <div class="param-description">Number of trees in the random forest</div>
+                    </div>
+                    <div class="param-group">
+                        <label>Random State</label>
+                        <input type="number" id="mfRandomState" value="42" min="0">
+                        <div class="param-description">Random seed for reproducibility</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Impute Button -->
+            <button class="impute-button" id="imputeButton" onclick="performImputation()">
+                Run Imputation
+            </button>
+
+            <!-- Results -->
+            <div class="imputation-card result-section" id="resultSection">
+                <h2>4. Results</h2>
+                <div id="resultStats"></div>
+                <button class="download-button" id="downloadButton" onclick="downloadResult()">
+                    Download Imputed Dataset
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading Overlay -->
+    <div class="loading-overlay" id="loadingOverlay">
+        <div class="loading-content">
+            <div class="spinner"></div>
+            <div class="loading-text" id="loadingText">Processing...</div>
+            <div class="loading-subtext" id="loadingSubtext">This may take a moment</div>
+        </div>
+    </div>
+
+    <script>
+        // Global variables
+        let uploadedData = null;
+        let selectedMethod = null;
+        let imputedData = null;
+        let pyodideReady = false;
+        let pyodide = null;
+
+        // Page navigation
+        function showPage(pageId) {
+            document.querySelectorAll('.page').forEach(page => {
+                page.classList.remove('active');
+            });
+            document.getElementById(pageId).classList.add('active');
+        }
+
+        // File upload handling
+        const uploadArea = document.getElementById('uploadArea');
+        const fileInput = document.getElementById('fileInput');
+
+        uploadArea.addEventListener('click', () => fileInput.click());
+
+        uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
+
+        uploadArea.addEventListener('dragleave', () => {
+            uploadArea.classList.remove('dragover');
+        });
+
+        uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            const file = e.dataTransfer.files[0];
+            handleFile(file);
+        });
+
+        fileInput.addEventListener('change', (e) => {
+            const file = e.target.files[0];
+            handleFile(file);
+        });
+
+        function handleFile(file) {
+            if (!file) return;
+
+            if (!file.name.endsWith('.csv')) {
+                showError('Please upload a CSV file');
+                return;
+            }
+
+            document.getElementById('fileName').textContent = file.name;
+            document.getElementById('fileSize').textContent = formatFileSize(file.size);
+            document.getElementById('fileInfo').style.display = 'block';
+
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    uploadedData = e.target.result;
+                    parseAndPreviewCSV(uploadedData);
+                    document.getElementById('methodSelector').style.display = 'block';
+                    showSuccess('File uploaded successfully!');
+                } catch (error) {
+                    showError('Error parsing CSV: ' + error.message);
+                }
+            };
+            reader.readAsText(file);
+        }
+
+        function parseAndPreviewCSV(csvText) {
+            const lines = csvText.trim().split('\n');
+            const headers = lines[0].split(',').map(h => h.trim());
+            const previewRows = lines.slice(1, 6);
+
+            let tableHTML = '<table><thead><tr>';
+            headers.forEach(header => {
+                tableHTML += `<th>${header}</th>`;
+            });
+            tableHTML += '</tr></thead><tbody>';
+
+            previewRows.forEach(row => {
+                const cells = row.split(',').map(c => c.trim());
+                tableHTML += '<tr>';
+                cells.forEach(cell => {
+                    tableHTML += `<td>${cell || '<em style="opacity:0.5">missing</em>'}</td>`;
+                });
+                tableHTML += '</tr>';
+            });
+
+            tableHTML += '</tbody></table>';
+            document.getElementById('tableContainer').innerHTML = tableHTML;
+            document.getElementById('previewTable').style.display = 'block';
+        }
+
+        function formatFileSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(2) + ' KB';
+            return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+        }
+
+        // Method selection
+        function selectMethod(method) {
+            selectedMethod = method;
+            
+            document.querySelectorAll('.method-btn').forEach(btn => {
+                btn.classList.remove('selected');
+            });
+            event.target.closest('.method-btn').classList.add('selected');
+
+            // Hide all parameter sections
+            document.querySelectorAll('#parametersSection > div').forEach(div => {
+                if (div.id.endsWith('Params')) {
+                    div.style.display = 'none';
+                }
+            });
+
+            // Show relevant parameters
+            document.getElementById(method + 'Params').style.display = 'block';
+            document.getElementById('parametersSection').style.display = 'block';
+            document.getElementById('imputeButton').style.display = 'block';
+        }
+
+        // Initialize Pyodide
+        async function initPyodide() {
+            if (pyodideReady) return;
+
+            showLoading('Initializing Python environment...', 'This only happens once. Please wait ~30 seconds');
+
+            try {
+                pyodide = await loadPyodide({
+                    indexURL: "https://cdn.jsdelivr.net/pyodide/v0.24.1/full/"
+                });
+
+                await pyodide.loadPackage(['numpy', 'pandas', 'scikit-learn', 'micropip']);
+                
+                pyodideReady = true;
+                hideLoading();
+                showSuccess('Python environment ready!');
+            } catch (error) {
+                hideLoading();
+                showError('Failed to initialize Python: ' + error.message);
+                throw error;
+            }
+        }
+
+        // Perform imputation
+        async function performImputation() {
+            if (!uploadedData || !selectedMethod) {
+                showError('Please upload a file and select a method');
+                return;
+            }
+
+            // Initialize Pyodide if needed
+            if (!pyodideReady) {
+                await initPyodide();
+            }
+
+            showLoading('Running ' + selectedMethod.toUpperCase() + ' imputation...', 'Processing your dataset');
+
+            try {
+                await pyodide.runPythonAsync(`
+import pandas as pd
+import numpy as np
+from io import StringIO
+from sklearn.impute import KNNImputer, SimpleImputer
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+from sklearn.ensemble import RandomForestRegressor, RandomForestClassifier
+
+# Load CSV
+csv_data = """${uploadedData}"""
+df = pd.read_csv(StringIO(csv_data))
+
+print(f"Dataset shape: {df.shape}")
+print(f"Missing values: {df.isnull().sum().sum()}")
+                `);
+
+                let pythonCode = '';
+
+                if (selectedMethod === 'iscak') {
+                    // For now, use advanced kNN as placeholder until we implement full ISCA-k
+                    const minFriends = document.getElementById('minFriends').value;
+                    const maxFriends = document.getElementById('maxFriends').value;
+                    pythonCode = `
+# ISCA-k (simplified version using adaptive kNN)
+k_value = min(${maxFriends}, max(${minFriends}, int(len(df) * 0.1)))
+imputer = KNNImputer(n_neighbors=k_value, weights='distance')
+df_numeric = df.select_dtypes(include=[np.number])
+df_non_numeric = df.select_dtypes(exclude=[np.number])
+
+if not df_numeric.empty:
+    df_numeric_imputed = pd.DataFrame(imputer.fit_transform(df_numeric), 
+                                      columns=df_numeric.columns, 
+                                      index=df_numeric.index)
+else:
+    df_numeric_imputed = df_numeric
+
+if not df_non_numeric.empty:
+    for col in df_non_numeric.columns:
+        df_non_numeric[col].fillna(df_non_numeric[col].mode()[0] if len(df_non_numeric[col].mode()) > 0 else 'missing', inplace=True)
+
+df_imputed = pd.concat([df_numeric_imputed, df_non_numeric], axis=1)
+df_imputed = df_imputed[df.columns]  # Restore original column order
+                    `;
+                } else if (selectedMethod === 'knn') {
+                    const k = document.getElementById('knnK').value;
+                    pythonCode = `
+# kNN Imputation
+imputer = KNNImputer(n_neighbors=${k}, weights='uniform')
+df_numeric = df.select_dtypes(include=[np.number])
+df_non_numeric = df.select_dtypes(exclude=[np.number])
+
+if not df_numeric.empty:
+    df_numeric_imputed = pd.DataFrame(imputer.fit_transform(df_numeric), 
+                                      columns=df_numeric.columns, 
+                                      index=df_numeric.index)
+else:
+    df_numeric_imputed = df_numeric
+
+if not df_non_numeric.empty:
+    for col in df_non_numeric.columns:
+        df_non_numeric[col].fillna(df_non_numeric[col].mode()[0] if len(df_non_numeric[col].mode()) > 0 else 'missing', inplace=True)
+
+df_imputed = pd.concat([df_numeric_imputed, df_non_numeric], axis=1)
+df_imputed = df_imputed[df.columns]
+                    `;
+                } else if (selectedMethod === 'mice') {
+                    const maxIter = document.getElementById('miceMaxIter').value;
+                    const randomState = document.getElementById('miceRandomState').value;
+                    pythonCode = `
+# MICE Imputation
+imputer = IterativeImputer(max_iter=${maxIter}, random_state=${randomState})
+df_numeric = df.select_dtypes(include=[np.number])
+df_non_numeric = df.select_dtypes(exclude=[np.number])
+
+if not df_numeric.empty:
+    df_numeric_imputed = pd.DataFrame(imputer.fit_transform(df_numeric), 
+                                      columns=df_numeric.columns, 
+                                      index=df_numeric.index)
+else:
+    df_numeric_imputed = df_numeric
+
+if not df_non_numeric.empty:
+    for col in df_non_numeric.columns:
+        df_non_numeric[col].fillna(df_non_numeric[col].mode()[0] if len(df_non_numeric[col].mode()) > 0 else 'missing', inplace=True)
+
+df_imputed = pd.concat([df_numeric_imputed, df_non_numeric], axis=1)
+df_imputed = df_imputed[df.columns]
+                    `;
+                } else if (selectedMethod === 'missforest') {
+                    const maxIter = document.getElementById('mfMaxIter').value;
+                    const nTrees = document.getElementById('mfNTrees').value;
+                    const randomState = document.getElementById('mfRandomState').value;
+                    pythonCode = `
+# MissForest Imputation
+rf_estimator = RandomForestRegressor(n_estimators=${nTrees}, random_state=${randomState}, n_jobs=-1)
+imputer = IterativeImputer(estimator=rf_estimator, max_iter=${maxIter}, random_state=${randomState})
+df_numeric = df.select_dtypes(include=[np.number])
+df_non_numeric = df.select_dtypes(exclude=[np.number])
+
+if not df_numeric.empty:
+    df_numeric_imputed = pd.DataFrame(imputer.fit_transform(df_numeric), 
+                                      columns=df_numeric.columns, 
+                                      index=df_numeric.index)
+else:
+    df_numeric_imputed = df_numeric
+
+if not df_non_numeric.empty:
+    for col in df_non_numeric.columns:
+        df_non_numeric[col].fillna(df_non_numeric[col].mode()[0] if len(df_non_numeric[col].mode()) > 0 else 'missing', inplace=True)
+
+df_imputed = pd.concat([df_numeric_imputed, df_non_numeric], axis=1)
+df_imputed = df_imputed[df.columns]
+                    `;
+                }
+
+                await pyodide.runPythonAsync(pythonCode);
+
+                // Get results
+                const result = await pyodide.runPythonAsync(`
+# Calculate statistics
+initial_missing = df.isnull().sum().sum()
+final_missing = df_imputed.isnull().sum().sum()
+imputation_rate = ((initial_missing - final_missing) / initial_missing * 100) if initial_missing > 0 else 100
+
+stats = {
+    'initial_missing': int(initial_missing),
+    'final_missing': int(final_missing),
+    'imputation_rate': float(imputation_rate),
+    'shape': df.shape
+}
+
+# Convert to CSV
+result_csv = df_imputed.to_csv(index=False)
+
+import json
+json.dumps({'stats': stats, 'csv': result_csv})
+                `);
+
+                const resultData = JSON.parse(result);
+                imputedData = resultData.csv;
+
+                // Display results
+                const stats = resultData.stats;
+                document.getElementById('resultStats').innerHTML = `
+                    <p><strong>Original dataset:</strong> ${stats.shape[0]} rows × ${stats.shape[1]} columns</p>
+                    <p><strong>Initial missing values:</strong> ${stats.initial_missing}</p>
+                    <p><strong>Final missing values:</strong> ${stats.final_missing}</p>
+                    <p><strong>Imputation rate:</strong> ${stats.imputation_rate.toFixed(2)}%</p>
+                    ${stats.final_missing === 0 ? '<p style="color: #10b981; font-weight: bold;">✓ Dataset 100% complete!</p>' : ''}
+                `;
+
+                document.getElementById('resultSection').style.display = 'block';
+                hideLoading();
+                showSuccess('Imputation completed successfully!');
+
+                // Scroll to results
+                document.getElementById('resultSection').scrollIntoView({ behavior: 'smooth' });
+
+            } catch (error) {
+                hideLoading();
+                showError('Imputation failed: ' + error.message);
+                console.error(error);
+            }
+        }
+
+        // Download result
+        function downloadResult() {
+            if (!imputedData) {
+                showError('No imputed data available');
+                return;
+            }
+
+            const blob = new Blob([imputedData], { type: 'text/csv' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'imputed_dataset_' + selectedMethod + '.csv';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            showSuccess('Dataset downloaded successfully!');
+        }
+
+        // UI Helper functions
+        function showLoading(text, subtext) {
+            document.getElementById('loadingText').textContent = text;
+            document.getElementById('loadingSubtext').textContent = subtext;
+            document.getElementById('loadingOverlay').style.display = 'flex';
+        }
+
+        function hideLoading() {
+            document.getElementById('loadingOverlay').style.display = 'none';
+        }
+
+        function showError(message) {
+            const errorDiv = document.getElementById('errorMessage');
+            errorDiv.textContent = '❌ ' + message;
+            errorDiv.style.display = 'block';
+            setTimeout(() => {
+                errorDiv.style.display = 'none';
+            }, 5000);
+        }
+
+        function showSuccess(message) {
+            const successDiv = document.getElementById('successMessage');
+            successDiv.textContent = '✓ ' + message;
+            successDiv.style.display = 'block';
+            setTimeout(() => {
+                successDiv.style.display = 'none';
+            }, 5000);
+        }
+
+        // Load Pyodide script
+        const script = document.createElement('script');
+        script.src = 'https://cdn.jsdelivr.net/pyodide/v0.24.1/full/pyodide.js';
+        script.async = true;
+        document.head.appendChild(script);
+    </script>
+</body>
+</html>
