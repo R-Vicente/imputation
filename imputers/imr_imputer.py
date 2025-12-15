@@ -16,9 +16,9 @@ class IMRInitializer:
             if result[col].isna().any():
                 mode_val = result[col].mode()
                 if len(mode_val) > 0:
-                    result[col].fillna(mode_val[0], inplace=True)
+                    result.loc[:, col] = result[col].fillna(mode_val[0])
                 else:
-                    result[col].fillna(0, inplace=True)
+                    result.loc[:, col] = result[col].fillna(0)
         for iteration in range(self.n_iterations):
             missings_before = result[numeric_cols].isna().sum().sum()
             if missings_before == 0:
@@ -59,9 +59,9 @@ class IMRInitializer:
             if result[col].isna().any():
                 median_val = result[col].median()
                 if not pd.isna(median_val):
-                    result[col].fillna(median_val, inplace=True)
+                    result.loc[:, col] = result[col].fillna(median_val)
                 else:
-                    result[col].fillna(0, inplace=True)
+                    result.loc[:, col] = result[col].fillna(0)
         return result
 
     def _calculate_mi_numeric(self, data: pd.DataFrame, numeric_cols: list):

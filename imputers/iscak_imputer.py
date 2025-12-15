@@ -1,8 +1,14 @@
+"""
+ISCA-k: Information-theoretic Smart Collaborative Approach with adaptive k
+
+Método híbrido de imputação baseado em:
+- Informação Mútua para ponderação de variáveis
+- Seleção dinâmica de "amigos" (vizinhos) baseada em factor de confiança
+"""
 import numpy as np
 import pandas as pd
 import time
 from pathlib import Path
-from collections import defaultdict
 
 from preprocessing.type_detection import MixedDataHandler
 from preprocessing.scaling import get_scaled_data, compute_range_factors
@@ -51,40 +57,50 @@ class ISCAkCore:
         complete_rows = (~missing_mask).all(axis=1).sum()
         pct_complete_rows = complete_rows / len(data) * 100
         if self.verbose:
-            print(f"\\nLinhas 100% completas: {complete_rows}/{len(data)} ({pct_complete_rows:.1f}%)")
-        # DECISÃO DE ESTRATÉGIA BASEADA NO TIPO DE DADOS
-        n_numeric = len(self.mixed_handler.numeric_cols)
-        n_categorical = (len(self.mixed_handler.binary_cols) + 
-                        len(self.mixed_handler.nominal_cols) + 
+            print(f"\nLinhas 100% completas: {complete_rows}/{len(data)} ({pct_complete_rows:.1f}%)")
+
+        # Seleccionar e executar estratégia apropriada
+        result_encoded = self._select_and_run_strategy(
+            data_encoded, missing_mask, initial_missing,
+            pct_complete_rows, start_time
+        )
+
+        result = self.mixed_handler.inverse_transform(result_encoded)
+        return result
+
+    def _select_and_run_strategy(self, data_encoded, missing_mask,
+                                  initial_missing, pct_complete_rows, start_time):
+        """Selecciona e executa a estratégia apropriada."""
+        from strategies.iscak_strategy import ISCAkStrategy
+        from strategies.imr_strategy import IMRStrategy
+        from strategies.bootstrap_strategy import BootstrapStrategy
+
+        n_categorical = (len(self.mixed_handler.binary_cols) +
+                        len(self.mixed_handler.nominal_cols) +
                         len(self.mixed_handler.ordinal_cols))
-        
+
         # DADOS PURAMENTE NUMÉRICOS
         if n_categorical == 0:
             if pct_complete_rows >= 5.0:
                 if self.verbose:
                     print(f"Estratégia: ISCA-k puro (dados numéricos, >= 5% linhas completas)")
-                result_encoded = self._strategy_iscak_first(data_encoded, missing_mask, 
-                                                           initial_missing, start_time)
+                strategy = ISCAkStrategy()
             else:
                 if self.verbose:
                     print(f"Estratégia: IMR -> ISCA-k (dados numéricos, < 5% linhas completas)")
-                result_encoded = self._strategy_imr_first(data_encoded, missing_mask, 
-                                                         initial_missing, start_time)
-        
+                strategy = IMRStrategy()
         # DADOS MISTOS OU PURAMENTE CATEGÓRICOS
         else:
             if pct_complete_rows >= 5.0:
                 if self.verbose:
                     print(f"Estratégia: ISCA-k puro (dados mistos, >= 5% linhas completas)")
-                result_encoded = self._strategy_iscak_first(data_encoded, missing_mask, 
-                                                           initial_missing, start_time)
+                strategy = ISCAkStrategy()
             else:
                 if self.verbose:
                     print(f"Estratégia: Mediana/Moda -> ISCA-k (dados mistos, < 5% linhas completas)")
-                result_encoded = self._strategy_simple_bootstrap_first(data_encoded, missing_mask,
-                                                                       initial_missing, start_time)
-        result = self.mixed_handler.inverse_transform(result_encoded)
-        return result
+                strategy = BootstrapStrategy()
+
+        return strategy.run(self, data_encoded, missing_mask, initial_missing, start_time)
 
     def _simple_bootstrap(self, data: pd.DataFrame) -> pd.DataFrame:
         """
@@ -149,200 +165,7 @@ class ISCAkCore:
         return get_scaled_data(data, self.mixed_handler, cache=self._scaled_cache, force_refit=force_refit)
 
     def _compute_range_factors(self, data: pd.DataFrame, scaled_data: pd.DataFrame):
-        return compute_range_factors(data, scaled_data, self.mixed_handler, verbose=self.verbose)
-
-    def _strategy_iscak_first(self, data_encoded, missing_mask, initial_missing, start_time):
-        result = data_encoded.copy()
-        if self.verbose:
-            print(f"\\n{'='*70}")
-            print("FASE 1: ISCA-k PURO")
-            print(f"{'='*70}")
-            print(f"Missings iniciais: {initial_missing}")
-        scaled_data = self._get_scaled_data(result)
-        if self.verbose:
-            print("[1/3] Calculando Informacao Mutua...")
-        self.mi_matrix = calculate_mi_mixed(data_encoded, scaled_data,
-                                            self.mixed_handler.numeric_cols,
-                                            self.mixed_handler.binary_cols,
-                                            self.mixed_handler.nominal_cols,
-                                            self.mixed_handler.ordinal_cols,
-                                            mi_neighbors=self.mi_neighbors)
-        if self.verbose:
-            print("[2/3] Ordenando colunas por facilidade...")
-        columns_ordered = self._rank_columns(result)
-        if self.verbose:
-            print(f"      Ordem: {', '.join(columns_ordered[:5])}{'...' if len(columns_ordered) > 5 else ''}")
-        if self.verbose:
-            print("[3/3] Imputando colunas...")
-        n_imputed_per_col = {}
-        for col in columns_ordered:
-            if not result[col].isna().any():
-                continue
-            n_before = result[col].isna().sum()
-            result[col] = self._impute_column_mixed(result, col, scaled_data)
-            n_after = result[col].isna().sum()
-            n_imputed = n_before - n_after
-            n_imputed_per_col[col] = n_imputed
-            if self.verbose and n_imputed > 0:
-                print(f"      {col}: {n_imputed}/{n_before} imputados")
-        remaining_missing = result.isna().sum().sum()
-        progress = initial_missing - remaining_missing
-        if self.verbose:
-            print(f"\\nProgresso: -{progress} missings ({remaining_missing} restantes)")
-        if remaining_missing == 0:
-            end_time = time.time()
-            self.execution_stats = {
-                'initial_missing': initial_missing,
-                'final_missing': 0,
-                'execution_time': end_time - start_time,
-                'strategy': 'ISCA-k puro',
-                'cycles': 0
-            }
-            if self.verbose:
-                self._print_summary()
-            return result
-        return self._handle_residuals_with_imr(result, remaining_missing, initial_missing, 
-                                               columns_ordered, data_encoded, start_time, n_imputed_per_col)
-
-    def _strategy_imr_first(self, data_encoded, missing_mask, initial_missing, start_time):
-        from imputers.imr_imputer import IMRInitializer
-        result = data_encoded.copy()
-        if self.verbose:
-            print(f"\\n{'='*70}")
-            print("FASE 1: IMR INICIAL")
-            print(f"{'='*70}")
-            print(f"Missings iniciais: {initial_missing}")
-        non_numeric_cols = (self.mixed_handler.binary_cols + 
-                           self.mixed_handler.nominal_cols + 
-                           self.mixed_handler.ordinal_cols)
-        imr = IMRInitializer(n_iterations=3)
-        result = imr.fit_transform(
-            result, 
-            self.mixed_handler.numeric_cols,
-            non_numeric_cols
-        )
-        after_imr = result.isna().sum().sum()
-        if self.verbose:
-            print(f"Missings apos IMR: {after_imr}")
-        scaled_result = self._get_scaled_data(result, force_refit=True)
-        if self.verbose:
-            print(f"\\n{'='*70}")
-            print("FASE 2: ISCA-k REFINAMENTO")
-            print(f"{'='*70}")
-        self.mi_matrix = calculate_mi_mixed(result, scaled_result,
-                                            self.mixed_handler.numeric_cols,
-                                            self.mixed_handler.binary_cols,
-                                            self.mixed_handler.nominal_cols,
-                                            self.mixed_handler.ordinal_cols,
-                                            mi_neighbors=self.mi_neighbors)
-        columns_ordered = self._rank_columns(data_encoded)
-        n_refined_per_col = {}
-        for col in columns_ordered:
-            col_missing_mask = missing_mask[col]
-            if not col_missing_mask.any():
-                continue
-            n_before = col_missing_mask.sum()
-            refined_series = self._refine_column_mixed(data_encoded, col, scaled_result, col_missing_mask)
-            result.loc[col_missing_mask, col] = refined_series[col_missing_mask]
-            n_after = result[col].isna().sum()
-            n_refined = n_before - n_after
-            n_refined_per_col[col] = n_refined
-        remaining_missing = result.isna().sum().sum()
-        if remaining_missing == 0:
-            end_time = time.time()
-            self.execution_stats = {
-                'initial_missing': initial_missing,
-                'final_missing': 0,
-                'execution_time': end_time - start_time,
-                'strategy': 'IMR + ISCA-k',
-                'cycles': 0
-            }
-            if self.verbose:
-                self._print_summary()
-            return result
-        return self._handle_residuals_with_imr(result, remaining_missing, initial_missing,
-                                               columns_ordered, data_encoded, start_time, n_refined_per_col)
-
-    def _strategy_simple_bootstrap_first(self, data_encoded, missing_mask, 
-                                    initial_missing, start_time):
-        """
-        Estratégia: Bootstrap simples -> ISCA-k refinamento.
-        
-        USADA PARA: Dados mistos com < 5% linhas completas.
-        SUBSTITUI: IMR (que não funciona para categóricas).
-        """
-        result = data_encoded.copy()
-        
-        if self.verbose:
-            print(f"\n{'='*70}")
-            print("FASE 1: BOOTSTRAP SIMPLES (MEDIANA/MODA)")
-            print(f"{'='*70}")
-            print(f"Missings iniciais: {initial_missing}")
-        
-        # Bootstrap simples
-        result = self._simple_bootstrap(result)
-        
-        after_bootstrap = result.isna().sum().sum()
-        if self.verbose:
-            print(f"Missings após bootstrap: {after_bootstrap}")
-        
-        if after_bootstrap == 0:
-            # Bootstrap completou tudo, agora refina com ISCA-k
-            scaled_result = self._get_scaled_data(result, force_refit=True)
-            
-            if self.verbose:
-                print(f"\n{'='*70}")
-                print("FASE 2: ISCA-k REFINAMENTO")
-                print(f"{'='*70}")
-            
-            self.mi_matrix = calculate_mi_mixed(result, scaled_result,
-                                                self.mixed_handler.numeric_cols,
-                                                self.mixed_handler.binary_cols,
-                                                self.mixed_handler.nominal_cols,
-                                                self.mixed_handler.ordinal_cols,
-                                                mi_neighbors=self.mi_neighbors)
-            
-            columns_ordered = self._rank_columns(data_encoded)
-            
-            for col in columns_ordered:
-                col_missing_mask = missing_mask[col]
-                if not col_missing_mask.any():
-                    continue
-                
-                refined_series = self._refine_column_mixed(data_encoded, col, 
-                                                          scaled_result, col_missing_mask)
-                result.loc[col_missing_mask, col] = refined_series[col_missing_mask]
-            
-            remaining_missing = result.isna().sum().sum()
-            
-            end_time = time.time()
-            self.execution_stats = {
-                'initial_missing': initial_missing,
-                'final_missing': remaining_missing,
-                'execution_time': end_time - start_time,
-                'strategy': 'Simple Bootstrap + ISCA-k',
-                'cycles': 0
-            }
-            
-            if self.verbose:
-                self._print_summary()
-            
-            return result
-        else:
-            # Fallback se bootstrap falhou (muito raro)
-            if self.verbose:
-                print(f"AVISO: Bootstrap não completou ({after_bootstrap} missings restantes)")
-            
-            end_time = time.time()
-            self.execution_stats = {
-                'initial_missing': initial_missing,
-                'final_missing': after_bootstrap,
-                'execution_time': end_time - start_time,
-                'strategy': 'Simple Bootstrap (incompleto)',
-                'cycles': 0
-            }
-            
-            return result
+        return compute_range_factors(data, scaled_data, self.mixed_handler, verbose=False)
 
     def _handle_residuals_with_imr(self, result, remaining_missing, initial_missing,
                                    columns_ordered, original_data, start_time, prev_stats):
