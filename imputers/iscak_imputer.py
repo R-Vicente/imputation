@@ -3,7 +3,7 @@ ISCA-k: Information-theoretic Smart Collaborative Approach with adaptive k
 
 Método híbrido de imputação baseado em:
 - Informação Mútua para ponderação de variáveis
-- Seleção dinâmica de "amigos" (vizinhos) baseada em factor de confiança
+- Seleção dinâmica de "amigos" (vizinhos) baseada em densidade local e consistência
 """
 import numpy as np
 import pandas as pd
@@ -14,18 +14,32 @@ from preprocessing.type_detection import MixedDataHandler
 from preprocessing.scaling import get_scaled_data, compute_range_factors
 from core.mi_calculator import calculate_mi_mixed
 from core.distances import weighted_euclidean_batch, range_normalized_mixed_distance
-from core.adaptive_k import adaptive_k_from_distances
+from core.adaptive_k import adaptive_k_hybrid
+
 
 class ISCAkCore:
-    def __init__(self, min_friends: int = 3, max_friends: int = 15, 
+    def __init__(self, min_friends: int = 3, max_friends: int = 15,
                  mi_neighbors: int = 3, n_jobs: int = -1, verbose: bool = True,
-                 max_cycles: int = 3, categorical_threshold: int = 10):
+                 max_cycles: int = 3, categorical_threshold: int = 10,
+                 adaptive_k_alpha: float = 0.5):
+        """
+        Args:
+            min_friends: Número mínimo de vizinhos (k_min)
+            max_friends: Número máximo de vizinhos (k_max)
+            mi_neighbors: Vizinhos para estimativa de MI
+            n_jobs: Paralelização (-1 = todos os cores)
+            verbose: Mostrar progresso
+            max_cycles: Máximo de ciclos para residuais
+            categorical_threshold: Limite para detectar categóricas
+            adaptive_k_alpha: Peso densidade vs consistência (0=só consistência, 1=só densidade)
+        """
         self.min_friends = min_friends
         self.max_friends = max_friends
         self.mi_neighbors = mi_neighbors
         self.n_jobs = n_jobs
         self.verbose = verbose
         self.max_cycles = max_cycles
+        self.adaptive_k_alpha = adaptive_k_alpha
         self.scaler = None
         self.mi_matrix = None
         self.execution_stats = {}
@@ -34,7 +48,7 @@ class ISCAkCore:
         self._scaled_cache = {}
         self._cache_key = None
 
-    def impute(self, data: pd.DataFrame, 
+    def impute(self, data: pd.DataFrame,
                force_categorical: list = None,
                force_ordinal: dict = None,
                interactive: bool = True,
@@ -44,7 +58,7 @@ class ISCAkCore:
         if column_types_config and Path(column_types_config).exists():
             force_categorical, force_ordinal = MixedDataHandler.load_config(column_types_config)
         data_encoded, self.encoding_info = self.mixed_handler.fit_transform(
-            original_data, 
+            original_data,
             force_categorical=force_categorical,
             force_ordinal=force_ordinal,
             interactive=interactive,
@@ -105,60 +119,56 @@ class ISCAkCore:
     def _simple_bootstrap(self, data: pd.DataFrame) -> pd.DataFrame:
         """
         Bootstrap simples respeitando tipos de variáveis.
-        
+
         USADO PARA: Dados mistos com < 5% linhas completas.
         ALTERNATIVA AO IMR que não funciona para categóricas.
-        
+
         - Numéricas: Mediana
         - Binárias: Moda
         - Nominais: Moda
         - Ordinais: Mediana (em valores scaled [0,1])
-        
+
         Returns:
             DataFrame com todos os missings preenchidos
         """
         result = data.copy()
-        
+
         # Numéricas: mediana
         for col in self.mixed_handler.numeric_cols:
             if result[col].isna().any():
                 median_val = result[col].median()
                 if not pd.isna(median_val):
-                    # CORRIGIDO: Sem inplace
                     result.loc[:, col] = result[col].fillna(median_val)
                 else:
                     result.loc[:, col] = result[col].fillna(0)
-        
+
         # Binárias: moda
         for col in self.mixed_handler.binary_cols:
             if result[col].isna().any():
                 mode_val = result[col].mode()
                 if len(mode_val) > 0:
-                    # CORRIGIDO: Sem inplace
                     result.loc[:, col] = result[col].fillna(mode_val[0])
                 else:
                     result.loc[:, col] = result[col].fillna(0)
-        
+
         # Nominais: moda
         for col in self.mixed_handler.nominal_cols:
             if result[col].isna().any():
                 mode_val = result[col].mode()
                 if len(mode_val) > 0:
-                    # CORRIGIDO: Sem inplace
                     result.loc[:, col] = result[col].fillna(mode_val[0])
                 else:
                     result.loc[:, col] = result[col].fillna(0)
-        
+
         # Ordinais: mediana (já em escala [0,1])
         for col in self.mixed_handler.ordinal_cols:
             if result[col].isna().any():
                 median_val = result[col].median()
                 if not pd.isna(median_val):
-                    # CORRIGIDO: Sem inplace
                     result.loc[:, col] = result[col].fillna(median_val)
                 else:
                     result.loc[:, col] = result[col].fillna(0.5)
-        
+
         return result
 
     def _get_scaled_data(self, data: pd.DataFrame, force_refit: bool = False):
@@ -172,8 +182,8 @@ class ISCAkCore:
         from imputers.imr_imputer import IMRInitializer
         cycle = 0
         prev_progress = float('inf')
-        non_numeric_cols = (self.mixed_handler.binary_cols + 
-                           self.mixed_handler.nominal_cols + 
+        non_numeric_cols = (self.mixed_handler.binary_cols +
+                           self.mixed_handler.nominal_cols +
                            self.mixed_handler.ordinal_cols)
         while remaining_missing > 0 and cycle < self.max_cycles:
             cycle += 1
@@ -228,31 +238,49 @@ class ISCAkCore:
         complete_mask = ~missing_indices
         if complete_mask.sum() == 0:
             return result
+
         feature_cols = [c for c in data.columns if c != target_col]
         mi_scores = self.mi_matrix.loc[feature_cols, target_col]
         weights = mi_scores.values
         weights = weights / weights.sum() if weights.sum() > 0 else np.ones_like(weights) / len(weights)
         range_factors_full = self._compute_range_factors(data, scaled_data)
+
         numeric_mask = np.array([col in self.mixed_handler.numeric_cols for col in feature_cols], dtype=np.bool_)
         binary_mask = np.array([col in self.mixed_handler.binary_cols for col in feature_cols], dtype=np.bool_)
         ordinal_mask = np.array([col in self.mixed_handler.ordinal_cols for col in feature_cols], dtype=np.bool_)
         nominal_mask = np.array([col in self.mixed_handler.nominal_cols for col in feature_cols], dtype=np.bool_)
+
         X_ref_scaled = scaled_data.loc[complete_mask, feature_cols].values
         X_ref_original = data.loc[complete_mask, feature_cols].values
         y_ref = data.loc[complete_mask, target_col].values
+
         is_target_binary = target_col in self.mixed_handler.binary_cols
         is_target_nominal = target_col in self.mixed_handler.nominal_cols
         is_target_ordinal = target_col in self.mixed_handler.ordinal_cols
         is_target_categorical = is_target_binary or is_target_nominal or is_target_ordinal
+
         for idx in data[missing_indices].index:
             available = [c for c in feature_cols if not pd.isna(data.loc[idx, c])]
             if len(available) == 0:
                 continue
+
             avail_indices = [feature_cols.index(c) for c in available]
             sample_scaled = scaled_data.loc[idx, available].values
             sample_original = data.loc[idx, available].values
             X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
             X_ref_original_sub = X_ref_original[:, avail_indices]
+
+            # === FIX: Filtrar donors com NaN nas features disponíveis ===
+            valid_donors_mask = ~np.isnan(X_ref_scaled_sub).any(axis=1)
+            if valid_donors_mask.sum() < self.min_friends:
+                # Não há donors válidos suficientes, skip
+                continue
+
+            X_ref_scaled_sub = X_ref_scaled_sub[valid_donors_mask]
+            X_ref_original_sub = X_ref_original_sub[valid_donors_mask]
+            y_ref_local = y_ref[valid_donors_mask]
+            # === FIM FIX ===
+
             data_col_indices = [data.columns.get_loc(c) for c in available]
             range_factors_sub = range_factors_full[data_col_indices]
             weights_sub = weights[avail_indices].copy()
@@ -260,11 +288,13 @@ class ISCAkCore:
                 weights_sub = weights_sub / weights_sub.sum()
             else:
                 weights_sub = np.ones_like(weights_sub) / len(weights_sub)
+
             numeric_mask_sub = numeric_mask[avail_indices]
             binary_mask_sub = binary_mask[avail_indices]
             ordinal_mask_sub = ordinal_mask[avail_indices]
             nominal_mask_sub = nominal_mask[avail_indices]
             has_categorical = binary_mask_sub.any() or nominal_mask_sub.any() or ordinal_mask_sub.any()
+
             if not has_categorical:
                 distances = weighted_euclidean_batch(sample_scaled, X_ref_scaled_sub, weights_sub)
             else:
@@ -275,13 +305,21 @@ class ISCAkCore:
                     ordinal_mask_sub, nominal_mask_sub,
                     weights_sub, range_factors_sub
                 )
-            k = adaptive_k_from_distances(distances, self.min_friends, self.max_friends)
+
+            # === NOVO: adaptive k híbrido (densidade + consistência) ===
+            k = adaptive_k_hybrid(
+                distances, y_ref_local,
+                min_k=self.min_friends, max_k=self.max_friends,
+                alpha=self.adaptive_k_alpha, is_categorical=is_target_categorical
+            )
             k = min(k, len(distances))
             if k == 0:
                 continue
+
             friend_idx = np.argpartition(distances, k-1)[:k] if k < len(distances) else np.arange(len(distances))
-            friend_values = y_ref[friend_idx]
+            friend_values = y_ref_local[friend_idx]
             friend_distances = distances[friend_idx]
+
             if is_target_categorical:
                 if len(friend_values) == 1:
                     result.loc[idx] = friend_values[0]
@@ -299,38 +337,56 @@ class ISCAkCore:
                     w = 1 / (friend_distances + 1e-6)
                     w = w / w.sum()
                     result.loc[idx] = np.average(friend_values, weights=w)
+
         return result
 
-    def _refine_column_mixed(self, original_data: pd.DataFrame, target_col: str, 
+    def _refine_column_mixed(self, original_data: pd.DataFrame, target_col: str,
                              scaled_complete_df: pd.DataFrame, refine_mask_col: pd.Series) -> pd.Series:
         original_complete_mask = ~original_data[target_col].isna()
         if original_complete_mask.sum() == 0:
             return pd.Series(np.nan, index=original_data.index)
+
         feature_cols = [c for c in original_data.columns if c != target_col]
         mi_scores = self.mi_matrix.loc[feature_cols, target_col]
         weights = mi_scores.values
         weights = weights / weights.sum() if weights.sum() > 0 else np.ones_like(weights) / len(weights)
         range_factors_full = self._compute_range_factors(original_data, scaled_complete_df)
+
         numeric_mask = np.array([col in self.mixed_handler.numeric_cols for col in feature_cols], dtype=np.bool_)
         binary_mask = np.array([col in self.mixed_handler.binary_cols for col in feature_cols], dtype=np.bool_)
         ordinal_mask = np.array([col in self.mixed_handler.ordinal_cols for col in feature_cols], dtype=np.bool_)
         nominal_mask = np.array([col in self.mixed_handler.nominal_cols for col in feature_cols], dtype=np.bool_)
+
         refined = pd.Series(np.nan, index=original_data.index)
         X_ref_scaled = scaled_complete_df.loc[original_complete_mask, feature_cols].values
         X_ref_original = original_data.loc[original_complete_mask, feature_cols].values
         y_ref = original_data.loc[original_complete_mask, target_col].values
-        is_target_categorical = (target_col in self.mixed_handler.binary_cols or 
+
+        is_target_categorical = (target_col in self.mixed_handler.binary_cols or
                                 target_col in self.mixed_handler.nominal_cols or
                                 target_col in self.mixed_handler.ordinal_cols)
+
         for idx in refine_mask_col[refine_mask_col].index:
             available = [c for c in feature_cols if not pd.isna(original_data.loc[idx, c])]
             if len(available) == 0:
                 continue
+
             avail_indices = [feature_cols.index(c) for c in available]
             sample_scaled = scaled_complete_df.loc[idx, available].values
             sample_original = original_data.loc[idx, available].values
             X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
             X_ref_original_sub = X_ref_original[:, avail_indices]
+
+            # === FIX: Filtrar donors com NaN nas features disponíveis ===
+            valid_donors_mask = ~np.isnan(X_ref_scaled_sub).any(axis=1)
+            if valid_donors_mask.sum() < self.min_friends:
+                continue
+
+            X_ref_scaled_sub = X_ref_scaled_sub[valid_donors_mask]
+            X_ref_original_sub = X_ref_original_sub[valid_donors_mask]
+            y_ref_local = y_ref[valid_donors_mask]
+            # === FIM FIX ===
+
             data_col_indices = [original_data.columns.get_loc(c) for c in available]
             range_factors_sub = range_factors_full[data_col_indices]
             weights_sub = weights[avail_indices].copy()
@@ -338,11 +394,13 @@ class ISCAkCore:
                 weights_sub = weights_sub / weights_sub.sum()
             else:
                 weights_sub = np.ones_like(weights_sub) / len(weights_sub)
+
             numeric_mask_sub = numeric_mask[avail_indices]
             binary_mask_sub = binary_mask[avail_indices]
             ordinal_mask_sub = ordinal_mask[avail_indices]
             nominal_mask_sub = nominal_mask[avail_indices]
             has_categorical = binary_mask_sub.any() or nominal_mask_sub.any() or ordinal_mask_sub.any()
+
             if not has_categorical:
                 distances = weighted_euclidean_batch(sample_scaled, X_ref_scaled_sub, weights_sub)
             else:
@@ -353,13 +411,21 @@ class ISCAkCore:
                     ordinal_mask_sub, nominal_mask_sub,
                     weights_sub, range_factors_sub
                 )
-            k = adaptive_k_from_distances(distances, self.min_friends, self.max_friends)
+
+            # === NOVO: adaptive k híbrido ===
+            k = adaptive_k_hybrid(
+                distances, y_ref_local,
+                min_k=self.min_friends, max_k=self.max_friends,
+                alpha=self.adaptive_k_alpha, is_categorical=is_target_categorical
+            )
             k = min(k, len(distances))
             if k == 0:
                 continue
+
             friend_idx = np.argpartition(distances, k-1)[:k] if k < len(distances) else np.arange(len(distances))
-            friend_values = y_ref[friend_idx]
+            friend_values = y_ref_local[friend_idx]
             friend_distances = distances[friend_idx]
+
             if is_target_categorical:
                 if len(friend_values) == 1:
                     refined.loc[idx] = friend_values[0]
@@ -377,19 +443,21 @@ class ISCAkCore:
                     w = 1 / (friend_distances + 1e-6)
                     w = w / w.sum()
                     refined.loc[idx] = np.average(friend_values, weights=w)
+
         return refined
 
     def _print_header(self, data: pd.DataFrame):
-        print("\\n" + "="*70)
+        print("\n" + "="*70)
         print("ISCA-k: Information-theoretic Smart Collaborative Approach".center(70))
         print("="*70)
-        print(f"\\nDataset: {data.shape[0]} x {data.shape[1]}")
+        print(f"\nDataset: {data.shape[0]} x {data.shape[1]}")
         print(f"Missings: {data.isna().sum().sum()} ({data.isna().sum().sum()/data.size*100:.1f}%)")
         print(f"Parametros: min_friends={self.min_friends}, max_friends={self.max_friends}")
         print(f"MI neighbors: {self.mi_neighbors}")
+        print(f"Adaptive k alpha: {self.adaptive_k_alpha}")
         print(f"Max cycles: {self.max_cycles}")
         if self.mixed_handler.is_mixed:
-            print(f"\\nTipo dados: Misto")
+            print(f"\nTipo dados: Misto")
             print(f"  Numericas: {len(self.mixed_handler.numeric_cols)}")
             print(f"  Binarias: {len(self.mixed_handler.binary_cols)}")
             print(f"  Nominais: {len(self.mixed_handler.nominal_cols)}")
@@ -397,7 +465,7 @@ class ISCAkCore:
 
     def _print_summary(self):
         stats = self.execution_stats
-        print("\\n" + "="*70)
+        print("\n" + "="*70)
         print("RESULTADO")
         print("="*70)
         print(f"Estrategia: {stats.get('strategy', 'N/A')}")
@@ -412,4 +480,4 @@ class ISCAkCore:
             print(f"Taxa:     {taxa:.1f}%")
         print(f"Ciclos:   {stats.get('cycles', 0)}")
         print(f"Tempo:    {stats['execution_time']:.2f}s")
-        print("="*70 + "\\n")
+        print("="*70 + "\n")
