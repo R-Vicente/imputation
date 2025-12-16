@@ -13,23 +13,16 @@ from pathlib import Path
 from preprocessing.type_detection import MixedDataHandler
 from preprocessing.scaling import get_scaled_data, compute_range_factors
 from core.mi_calculator import calculate_mi_mixed
-from core.distances import weighted_euclidean_batch, range_normalized_mixed_distance
+from core.distances import (weighted_euclidean_batch, range_normalized_mixed_distance,
+                            weighted_euclidean_multi_query, mixed_distance_multi_query)
 from core.adaptive_k import adaptive_k_hybrid
-
-# Tentar importar BallTree para optimização
-try:
-    from sklearn.neighbors import BallTree
-    HAS_BALLTREE = True
-except ImportError:
-    HAS_BALLTREE = False
 
 
 class ISCAkCore:
     def __init__(self, min_friends: int = 3, max_friends: int = 15,
                  mi_neighbors: int = 3, n_jobs: int = -1, verbose: bool = True,
                  max_cycles: int = 3, categorical_threshold: int = 10,
-                 adaptive_k_alpha: float = 0.5, fast_mode: bool = False,
-                 use_balltree: bool = True):
+                 adaptive_k_alpha: float = 0.5, fast_mode: bool = False):
         """
         Args:
             min_friends: Número mínimo de vizinhos (k_min)
@@ -41,7 +34,6 @@ class ISCAkCore:
             categorical_threshold: Limite para detectar categóricas
             adaptive_k_alpha: Peso densidade vs consistência (0=só consistência, 1=só densidade)
             fast_mode: Se True, usa Spearman em vez de MI (muito mais rápido)
-            use_balltree: Se True, usa BallTree para busca de vizinhos (muito mais rápido)
         """
         self.min_friends = min_friends
         self.max_friends = max_friends
@@ -51,7 +43,6 @@ class ISCAkCore:
         self.max_cycles = max_cycles
         self.adaptive_k_alpha = adaptive_k_alpha
         self.fast_mode = fast_mode
-        self.use_balltree = use_balltree and HAS_BALLTREE
         self.scaler = None
         self.mi_matrix = None
         self.execution_stats = {}
@@ -245,6 +236,10 @@ class ISCAkCore:
         return [col for col, _ in scores]
 
     def _impute_column_mixed(self, data: pd.DataFrame, target_col: str, scaled_data: pd.DataFrame) -> pd.Series:
+        """
+        Imputa valores em falta para uma coluna usando batch processing.
+        Agrupa queries por padrão de disponibilidade para calcular distâncias em batch.
+        """
         result = data[target_col].copy()
         missing_indices = data[target_col].isna()
         complete_mask = ~missing_indices
@@ -271,105 +266,78 @@ class ISCAkCore:
         is_target_ordinal = target_col in self.mixed_handler.ordinal_cols
         is_target_categorical = is_target_binary or is_target_nominal or is_target_ordinal
 
-        # Verificar se podemos usar BallTree (dados numéricos puros)
-        is_all_numeric = numeric_mask.all()
-        use_tree = self.use_balltree and is_all_numeric and HAS_BALLTREE
-
-        # Preparar BallTree se aplicável
-        ball_tree = None
-        tree_y_ref = None
-        tree_valid_mask = None
-        sqrt_weights = None
-
-        if use_tree:
-            # Filtrar donors com NaN
-            tree_valid_mask = ~np.isnan(X_ref_scaled).any(axis=1)
-            if tree_valid_mask.sum() >= self.min_friends:
-                X_ref_valid = X_ref_scaled[tree_valid_mask]
-                tree_y_ref = y_ref[tree_valid_mask]
-                # Transformar dados: X_weighted = X * sqrt(weights)
-                sqrt_weights = np.sqrt(weights)
-                X_ref_weighted = X_ref_valid * sqrt_weights
-                ball_tree = BallTree(X_ref_weighted, metric='euclidean')
-
-        # Processar cada valor em falta
+        # === BATCH PROCESSING: Agrupar por padrão de disponibilidade ===
         missing_idx_list = data[missing_indices].index.tolist()
+        if len(missing_idx_list) == 0:
+            return result
 
+        # Criar padrões de disponibilidade (tuple de índices disponíveis)
+        pattern_groups = {}
         for idx in missing_idx_list:
-            available = [c for c in feature_cols if not pd.isna(data.loc[idx, c])]
-            if len(available) == 0:
+            avail_mask = ~data.loc[idx, feature_cols].isna()
+            avail_indices = tuple(np.where(avail_mask.values)[0])
+            if len(avail_indices) == 0:
+                continue
+            if avail_indices not in pattern_groups:
+                pattern_groups[avail_indices] = []
+            pattern_groups[avail_indices].append(idx)
+
+        # Processar cada grupo em batch
+        for avail_indices, group_indices in pattern_groups.items():
+            avail_indices = list(avail_indices)
+            available = [feature_cols[i] for i in avail_indices]
+
+            # Preparar dados dos donors para este padrão
+            X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
+            X_ref_original_sub = X_ref_original[:, avail_indices]
+
+            # Filtrar donors com NaN nas features disponíveis
+            valid_donors_mask = ~np.isnan(X_ref_scaled_sub).any(axis=1)
+            if valid_donors_mask.sum() < self.min_friends:
                 continue
 
-            avail_indices = [feature_cols.index(c) for c in available]
-            sample_scaled = scaled_data.loc[idx, available].values
+            X_ref_valid = X_ref_scaled_sub[valid_donors_mask]
+            X_ref_orig_valid = X_ref_original_sub[valid_donors_mask]
+            y_ref_valid = y_ref[valid_donors_mask]
 
-            # Tentar usar BallTree se todas as features estão disponíveis
-            if ball_tree is not None and len(available) == len(feature_cols) and not np.isnan(sample_scaled).any():
-                # Transformar query point
-                sample_weighted = sample_scaled * sqrt_weights
-                # Query: buscar max_friends vizinhos
-                k_query = min(self.max_friends, len(tree_y_ref))
-                distances_tree, indices_tree = ball_tree.query(
-                    sample_weighted.reshape(1, -1), k=k_query
-                )
-                distances = distances_tree[0]
-                neighbor_values = tree_y_ref[indices_tree[0]]
-
-                # Adaptive k
-                k = adaptive_k_hybrid(
-                    distances, neighbor_values,
-                    min_k=self.min_friends, max_k=self.max_friends,
-                    alpha=self.adaptive_k_alpha, is_categorical=is_target_categorical
-                )
-                k = min(k, len(distances))
-                if k == 0:
-                    continue
-
-                friend_values = neighbor_values[:k]
-                friend_distances = distances[:k]
+            # Preparar pesos e masks para este subset
+            data_col_indices = [data.columns.get_loc(c) for c in available]
+            range_factors_sub = range_factors_full[data_col_indices]
+            weights_sub = weights[avail_indices].copy()
+            if weights_sub.sum() > 0:
+                weights_sub = weights_sub / weights_sub.sum()
             else:
-                # Fallback: brute force para casos com features em falta ou dados mistos
-                sample_original = data.loc[idx, available].values
-                X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
-                X_ref_original_sub = X_ref_original[:, avail_indices]
+                weights_sub = np.ones_like(weights_sub) / len(weights_sub)
 
-                # Filtrar donors com NaN nas features disponíveis
-                valid_donors_mask = ~np.isnan(X_ref_scaled_sub).any(axis=1)
-                if valid_donors_mask.sum() < self.min_friends:
-                    continue
+            numeric_mask_sub = numeric_mask[avail_indices]
+            binary_mask_sub = binary_mask[avail_indices]
+            ordinal_mask_sub = ordinal_mask[avail_indices]
+            nominal_mask_sub = nominal_mask[avail_indices]
+            has_categorical = binary_mask_sub.any() or nominal_mask_sub.any() or ordinal_mask_sub.any()
 
-                X_ref_scaled_sub = X_ref_scaled_sub[valid_donors_mask]
-                X_ref_original_sub = X_ref_original_sub[valid_donors_mask]
-                y_ref_local = y_ref[valid_donors_mask]
+            # Preparar matriz de queries
+            queries_scaled = scaled_data.loc[group_indices, available].values
+            queries_original = data.loc[group_indices, available].values
 
-                data_col_indices = [data.columns.get_loc(c) for c in available]
-                range_factors_sub = range_factors_full[data_col_indices]
-                weights_sub = weights[avail_indices].copy()
-                if weights_sub.sum() > 0:
-                    weights_sub = weights_sub / weights_sub.sum()
-                else:
-                    weights_sub = np.ones_like(weights_sub) / len(weights_sub)
+            # Calcular distâncias em BATCH (n_queries x n_donors)
+            if not has_categorical:
+                dist_matrix = weighted_euclidean_multi_query(queries_scaled, X_ref_valid, weights_sub)
+            else:
+                dist_matrix = mixed_distance_multi_query(
+                    queries_scaled, X_ref_valid,
+                    queries_original, X_ref_orig_valid,
+                    numeric_mask_sub, binary_mask_sub,
+                    ordinal_mask_sub, nominal_mask_sub,
+                    weights_sub
+                )
 
-                numeric_mask_sub = numeric_mask[avail_indices]
-                binary_mask_sub = binary_mask[avail_indices]
-                ordinal_mask_sub = ordinal_mask[avail_indices]
-                nominal_mask_sub = nominal_mask[avail_indices]
-                has_categorical = binary_mask_sub.any() or nominal_mask_sub.any() or ordinal_mask_sub.any()
-
-                if not has_categorical:
-                    distances = weighted_euclidean_batch(sample_scaled, X_ref_scaled_sub, weights_sub)
-                else:
-                    distances = range_normalized_mixed_distance(
-                        sample_scaled, X_ref_scaled_sub,
-                        sample_original, X_ref_original_sub,
-                        numeric_mask_sub, binary_mask_sub,
-                        ordinal_mask_sub, nominal_mask_sub,
-                        weights_sub, range_factors_sub
-                    )
+            # Processar cada query do grupo
+            for q_idx, idx in enumerate(group_indices):
+                distances = dist_matrix[q_idx]
 
                 # Adaptive k
                 k = adaptive_k_hybrid(
-                    distances, y_ref_local,
+                    distances, y_ref_valid,
                     min_k=self.min_friends, max_k=self.max_friends,
                     alpha=self.adaptive_k_alpha, is_categorical=is_target_categorical
                 )
@@ -378,32 +346,35 @@ class ISCAkCore:
                     continue
 
                 friend_idx = np.argpartition(distances, k-1)[:k] if k < len(distances) else np.arange(len(distances))
-                friend_values = y_ref_local[friend_idx]
+                friend_values = y_ref_valid[friend_idx]
                 friend_distances = distances[friend_idx]
 
-            # Imputar valor
-            if is_target_categorical:
-                if len(friend_values) == 1:
-                    result.loc[idx] = friend_values[0]
+                # Imputar valor
+                if is_target_categorical:
+                    if len(friend_values) == 1:
+                        result.loc[idx] = friend_values[0]
+                    else:
+                        weighted_votes = {}
+                        for val, dist in zip(friend_values, friend_distances):
+                            weight = 1 / (dist + 1e-6)
+                            weighted_votes[val] = weighted_votes.get(val, 0) + weight
+                        result.loc[idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
                 else:
-                    weighted_votes = {}
-                    for val, dist in zip(friend_values, friend_distances):
-                        weight = 1 / (dist + 1e-6)
-                        weighted_votes[val] = weighted_votes.get(val, 0) + weight
-                    result.loc[idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
-            else:
-                if np.any(friend_distances < 1e-10):
-                    exact_mask = friend_distances < 1e-10
-                    result.loc[idx] = np.mean(friend_values[exact_mask])
-                else:
-                    w = 1 / (friend_distances + 1e-6)
-                    w = w / w.sum()
-                    result.loc[idx] = np.average(friend_values, weights=w)
+                    if np.any(friend_distances < 1e-10):
+                        exact_mask = friend_distances < 1e-10
+                        result.loc[idx] = np.mean(friend_values[exact_mask])
+                    else:
+                        w = 1 / (friend_distances + 1e-6)
+                        w = w / w.sum()
+                        result.loc[idx] = np.average(friend_values, weights=w)
 
         return result
 
     def _refine_column_mixed(self, original_data: pd.DataFrame, target_col: str,
                              scaled_complete_df: pd.DataFrame, refine_mask_col: pd.Series) -> pd.Series:
+        """
+        Refina valores imputados usando batch processing.
+        """
         original_complete_mask = ~original_data[target_col].isna()
         if original_complete_mask.sum() == 0:
             return pd.Series(np.nan, index=original_data.index)
@@ -428,26 +399,36 @@ class ISCAkCore:
                                 target_col in self.mixed_handler.nominal_cols or
                                 target_col in self.mixed_handler.ordinal_cols)
 
-        for idx in refine_mask_col[refine_mask_col].index:
-            available = [c for c in feature_cols if not pd.isna(original_data.loc[idx, c])]
-            if len(available) == 0:
-                continue
+        # === BATCH PROCESSING: Agrupar por padrão de disponibilidade ===
+        refine_idx_list = refine_mask_col[refine_mask_col].index.tolist()
+        if len(refine_idx_list) == 0:
+            return refined
 
-            avail_indices = [feature_cols.index(c) for c in available]
-            sample_scaled = scaled_complete_df.loc[idx, available].values
-            sample_original = original_data.loc[idx, available].values
+        pattern_groups = {}
+        for idx in refine_idx_list:
+            avail_mask = ~original_data.loc[idx, feature_cols].isna()
+            avail_indices = tuple(np.where(avail_mask.values)[0])
+            if len(avail_indices) == 0:
+                continue
+            if avail_indices not in pattern_groups:
+                pattern_groups[avail_indices] = []
+            pattern_groups[avail_indices].append(idx)
+
+        # Processar cada grupo em batch
+        for avail_indices, group_indices in pattern_groups.items():
+            avail_indices = list(avail_indices)
+            available = [feature_cols[i] for i in avail_indices]
+
             X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
             X_ref_original_sub = X_ref_original[:, avail_indices]
 
-            # === FIX: Filtrar donors com NaN nas features disponíveis ===
             valid_donors_mask = ~np.isnan(X_ref_scaled_sub).any(axis=1)
             if valid_donors_mask.sum() < self.min_friends:
                 continue
 
-            X_ref_scaled_sub = X_ref_scaled_sub[valid_donors_mask]
-            X_ref_original_sub = X_ref_original_sub[valid_donors_mask]
-            y_ref_local = y_ref[valid_donors_mask]
-            # === FIM FIX ===
+            X_ref_valid = X_ref_scaled_sub[valid_donors_mask]
+            X_ref_orig_valid = X_ref_original_sub[valid_donors_mask]
+            y_ref_valid = y_ref[valid_donors_mask]
 
             data_col_indices = [original_data.columns.get_loc(c) for c in available]
             range_factors_sub = range_factors_full[data_col_indices]
@@ -463,48 +444,53 @@ class ISCAkCore:
             nominal_mask_sub = nominal_mask[avail_indices]
             has_categorical = binary_mask_sub.any() or nominal_mask_sub.any() or ordinal_mask_sub.any()
 
+            queries_scaled = scaled_complete_df.loc[group_indices, available].values
+            queries_original = original_data.loc[group_indices, available].values
+
             if not has_categorical:
-                distances = weighted_euclidean_batch(sample_scaled, X_ref_scaled_sub, weights_sub)
+                dist_matrix = weighted_euclidean_multi_query(queries_scaled, X_ref_valid, weights_sub)
             else:
-                distances = range_normalized_mixed_distance(
-                    sample_scaled, X_ref_scaled_sub,
-                    sample_original, X_ref_original_sub,
+                dist_matrix = mixed_distance_multi_query(
+                    queries_scaled, X_ref_valid,
+                    queries_original, X_ref_orig_valid,
                     numeric_mask_sub, binary_mask_sub,
                     ordinal_mask_sub, nominal_mask_sub,
-                    weights_sub, range_factors_sub
+                    weights_sub
                 )
 
-            # === NOVO: adaptive k híbrido ===
-            k = adaptive_k_hybrid(
-                distances, y_ref_local,
-                min_k=self.min_friends, max_k=self.max_friends,
-                alpha=self.adaptive_k_alpha, is_categorical=is_target_categorical
-            )
-            k = min(k, len(distances))
-            if k == 0:
-                continue
+            for q_idx, idx in enumerate(group_indices):
+                distances = dist_matrix[q_idx]
 
-            friend_idx = np.argpartition(distances, k-1)[:k] if k < len(distances) else np.arange(len(distances))
-            friend_values = y_ref_local[friend_idx]
-            friend_distances = distances[friend_idx]
+                k = adaptive_k_hybrid(
+                    distances, y_ref_valid,
+                    min_k=self.min_friends, max_k=self.max_friends,
+                    alpha=self.adaptive_k_alpha, is_categorical=is_target_categorical
+                )
+                k = min(k, len(distances))
+                if k == 0:
+                    continue
 
-            if is_target_categorical:
-                if len(friend_values) == 1:
-                    refined.loc[idx] = friend_values[0]
+                friend_idx = np.argpartition(distances, k-1)[:k] if k < len(distances) else np.arange(len(distances))
+                friend_values = y_ref_valid[friend_idx]
+                friend_distances = distances[friend_idx]
+
+                if is_target_categorical:
+                    if len(friend_values) == 1:
+                        refined.loc[idx] = friend_values[0]
+                    else:
+                        weighted_votes = {}
+                        for val, dist in zip(friend_values, friend_distances):
+                            weight = 1 / (dist + 1e-6)
+                            weighted_votes[val] = weighted_votes.get(val, 0) + weight
+                        refined.loc[idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
                 else:
-                    weighted_votes = {}
-                    for val, dist in zip(friend_values, friend_distances):
-                        weight = 1 / (dist + 1e-6)
-                        weighted_votes[val] = weighted_votes.get(val, 0) + weight
-                    refined.loc[idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
-            else:
-                if np.any(friend_distances < 1e-10):
-                    exact_mask = friend_distances < 1e-10
-                    refined.loc[idx] = np.mean(friend_values[exact_mask])
-                else:
-                    w = 1 / (friend_distances + 1e-6)
-                    w = w / w.sum()
-                    refined.loc[idx] = np.average(friend_values, weights=w)
+                    if np.any(friend_distances < 1e-10):
+                        exact_mask = friend_distances < 1e-10
+                        refined.loc[idx] = np.mean(friend_values[exact_mask])
+                    else:
+                        w = 1 / (friend_distances + 1e-6)
+                        w = w / w.sum()
+                        refined.loc[idx] = np.average(friend_values, weights=w)
 
         return refined
 
@@ -518,7 +504,6 @@ class ISCAkCore:
         print(f"MI neighbors: {self.mi_neighbors}")
         print(f"Adaptive k alpha: {self.adaptive_k_alpha}")
         print(f"Fast mode: {self.fast_mode}")
-        print(f"Use BallTree: {self.use_balltree}")
         print(f"Max cycles: {self.max_cycles}")
         if self.mixed_handler.is_mixed:
             print(f"\nTipo dados: Misto")

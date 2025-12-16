@@ -95,6 +95,69 @@ def quantile_lookup_batch(friend_vals, friend_sorted, target_sorted):
         result[i] = target_sorted[target_idx]
     return result
 
+
+@jit(nopython=True, parallel=True, cache=True)
+def weighted_euclidean_multi_query(queries, reference_matrix, weights):
+    """
+    Calcula distâncias euclidianas ponderadas para múltiplas queries em batch.
+
+    Args:
+        queries: Matriz (n_queries x n_features) de queries
+        reference_matrix: Matriz (n_ref x n_features) de referências
+        weights: Vetor de pesos por feature
+
+    Returns:
+        Matriz (n_queries x n_ref) de distâncias
+    """
+    n_queries = queries.shape[0]
+    n_ref = reference_matrix.shape[0]
+    distances = np.empty((n_queries, n_ref))
+
+    for q in prange(n_queries):
+        for i in range(n_ref):
+            diff = np.abs(reference_matrix[i] - queries[q])
+            weighted_diff = diff * weights
+            distances[q, i] = np.sqrt(np.sum(weighted_diff ** 2))
+
+    return distances
+
+
+@jit(nopython=True, parallel=True, cache=True)
+def mixed_distance_multi_query(queries, reference_matrix,
+                               queries_original, reference_original,
+                               numeric_mask, binary_mask,
+                               ordinal_mask, nominal_mask,
+                               weights):
+    """
+    Calcula distâncias mistas para múltiplas queries em batch.
+    """
+    n_queries = queries.shape[0]
+    n_ref = reference_matrix.shape[0]
+    n_features = queries.shape[1]
+    distances = np.empty((n_queries, n_ref))
+
+    for q in prange(n_queries):
+        for i in range(n_ref):
+            weighted_dist = 0.0
+            total_weight = 0.0
+            for j in range(n_features):
+                w = weights[j]
+                if numeric_mask[j]:
+                    contrib = np.abs(queries[q, j] - reference_matrix[i, j]) * w
+                elif ordinal_mask[j]:
+                    contrib = np.abs(queries[q, j] - reference_matrix[i, j]) * w
+                elif binary_mask[j]:
+                    contrib = 0.0 if queries[q, j] == reference_matrix[i, j] else w
+                elif nominal_mask[j]:
+                    contrib = 0.0 if queries_original[q, j] == reference_original[i, j] else w
+                else:
+                    contrib = 0.0
+                weighted_dist += contrib
+                total_weight += w
+            distances[q, i] = weighted_dist / total_weight if total_weight > 0 else 0.0
+
+    return distances
+
 def _warmup_numba():
     try:
         dummy_friend = np.array([1.0,2.0,3.0,4.0,5.0])
@@ -123,5 +186,14 @@ def _warmup_numba():
                                            dummy_numeric_mask, dummy_binary_mask,
                                            dummy_ordinal_mask, dummy_nominal_mask,
                                            dummy_weights, dummy_range_factors)
+        # Warmup batch functions
+        dummy_queries = np.array([[0.5,0.3],[0.2,0.8]])
+        _ = weighted_euclidean_multi_query(dummy_queries, dummy_ref, dummy_weights)
+        dummy_queries_orig = np.array([[1.0,0.0],[0.0,1.0]])
+        _ = mixed_distance_multi_query(dummy_queries, dummy_ref,
+                                       dummy_queries_orig, dummy_ref_orig,
+                                       dummy_numeric_mask, dummy_binary_mask,
+                                       dummy_ordinal_mask, dummy_nominal_mask,
+                                       dummy_weights)
     except Exception as e:
         warnings.warn(f"Numba warmup failed: {e}. Performance may be slower on first run.")
