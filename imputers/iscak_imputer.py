@@ -21,7 +21,7 @@ class ISCAkCore:
     def __init__(self, min_friends: int = 3, max_friends: int = 15,
                  mi_neighbors: int = 3, n_jobs: int = -1, verbose: bool = True,
                  max_cycles: int = 3, categorical_threshold: int = 10,
-                 adaptive_k_alpha: float = 0.5):
+                 adaptive_k_alpha: float = 0.5, fast_mode: bool = False):
         """
         Args:
             min_friends: Número mínimo de vizinhos (k_min)
@@ -32,6 +32,7 @@ class ISCAkCore:
             max_cycles: Máximo de ciclos para residuais
             categorical_threshold: Limite para detectar categóricas
             adaptive_k_alpha: Peso densidade vs consistência (0=só consistência, 1=só densidade)
+            fast_mode: Se True, usa Spearman em vez de MI (muito mais rápido)
         """
         self.min_friends = min_friends
         self.max_friends = max_friends
@@ -40,6 +41,7 @@ class ISCAkCore:
         self.verbose = verbose
         self.max_cycles = max_cycles
         self.adaptive_k_alpha = adaptive_k_alpha
+        self.fast_mode = fast_mode
         self.scaler = None
         self.mi_matrix = None
         self.execution_stats = {}
@@ -455,6 +457,7 @@ class ISCAkCore:
         print(f"Parametros: min_friends={self.min_friends}, max_friends={self.max_friends}")
         print(f"MI neighbors: {self.mi_neighbors}")
         print(f"Adaptive k alpha: {self.adaptive_k_alpha}")
+        print(f"Fast mode: {self.fast_mode}")
         print(f"Max cycles: {self.max_cycles}")
         if self.mixed_handler.is_mixed:
             print(f"\nTipo dados: Misto")
