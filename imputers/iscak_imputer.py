@@ -3,6 +3,7 @@ ISCA-k: Information-theoretic Smart Collaborative Approach with adaptive k
 
 Método híbrido de imputação baseado em:
 - Informação Mútua para ponderação de variáveis
+- Fuzzy C-Means com PDS para acelerar busca de vizinhos
 - Seleção dinâmica de "amigos" (vizinhos) baseada em densidade local e consistência
 """
 import numpy as np
@@ -16,13 +17,16 @@ from core.mi_calculator import calculate_mi_mixed
 from core.distances import (weighted_euclidean_batch, range_normalized_mixed_distance,
                             weighted_euclidean_multi_query, mixed_distance_multi_query)
 from core.adaptive_k import adaptive_k_hybrid
+from core.fuzzy_clustering import FuzzyClusterIndex
 
 
 class ISCAkCore:
     def __init__(self, min_friends: int = 3, max_friends: int = 15,
                  mi_neighbors: int = 3, n_jobs: int = -1, verbose: bool = True,
                  max_cycles: int = 3, categorical_threshold: int = 10,
-                 adaptive_k_alpha: float = 0.5, fast_mode: bool = False):
+                 adaptive_k_alpha: float = 0.5, fast_mode: bool = False,
+                 use_fcm: bool = False, n_clusters: int = 8,
+                 n_top_clusters: int = 3, fcm_membership_threshold: float = 0.05):
         """
         Args:
             min_friends: Número mínimo de vizinhos (k_min)
@@ -34,6 +38,10 @@ class ISCAkCore:
             categorical_threshold: Limite para detectar categóricas
             adaptive_k_alpha: Peso densidade vs consistência (0=só consistência, 1=só densidade)
             fast_mode: Se True, usa Spearman em vez de MI (muito mais rápido)
+            use_fcm: Se True, usa Fuzzy C-Means para acelerar busca de vizinhos
+            n_clusters: Número de clusters para FCM
+            n_top_clusters: Número de clusters a considerar na busca
+            fcm_membership_threshold: Threshold mínimo de membership
         """
         self.min_friends = min_friends
         self.max_friends = max_friends
@@ -43,8 +51,13 @@ class ISCAkCore:
         self.max_cycles = max_cycles
         self.adaptive_k_alpha = adaptive_k_alpha
         self.fast_mode = fast_mode
+        self.use_fcm = use_fcm
+        self.n_clusters = n_clusters
+        self.n_top_clusters = n_top_clusters
+        self.fcm_membership_threshold = fcm_membership_threshold
         self.scaler = None
         self.mi_matrix = None
+        self.fcm_index = None  # FuzzyClusterIndex
         self.execution_stats = {}
         self.mixed_handler = MixedDataHandler(categorical_threshold=categorical_threshold)
         self.encoding_info = None
@@ -237,8 +250,8 @@ class ISCAkCore:
 
     def _impute_column_mixed(self, data: pd.DataFrame, target_col: str, scaled_data: pd.DataFrame) -> pd.Series:
         """
-        Imputa valores em falta para uma coluna usando batch processing.
-        Agrupa queries por padrão de disponibilidade para calcular distâncias em batch.
+        Imputa valores em falta para uma coluna.
+        Usa FCM-PDS para acelerar busca de vizinhos se activado.
         """
         result = data[target_col].copy()
         missing_indices = data[target_col].isna()
@@ -257,42 +270,63 @@ class ISCAkCore:
         ordinal_mask = np.array([col in self.mixed_handler.ordinal_cols for col in feature_cols], dtype=np.bool_)
         nominal_mask = np.array([col in self.mixed_handler.nominal_cols for col in feature_cols], dtype=np.bool_)
 
+        # Dados de referência (donors com target completo)
         X_ref_scaled = scaled_data.loc[complete_mask, feature_cols].values
         X_ref_original = data.loc[complete_mask, feature_cols].values
         y_ref = data.loc[complete_mask, target_col].values
+        ref_indices = np.where(complete_mask.values)[0]  # Índices originais dos donors
 
         is_target_binary = target_col in self.mixed_handler.binary_cols
         is_target_nominal = target_col in self.mixed_handler.nominal_cols
         is_target_ordinal = target_col in self.mixed_handler.ordinal_cols
         is_target_categorical = is_target_binary or is_target_nominal or is_target_ordinal
 
-        # === BATCH PROCESSING: Agrupar por padrão de disponibilidade ===
+        # Verificar se usar FCM (só se temos muitos donors)
+        use_fcm_filtering = (self.use_fcm and self.fcm_index is not None and
+                            len(y_ref) > self.max_friends * 3)
+
+        # Processar cada missing value
         missing_idx_list = data[missing_indices].index.tolist()
         if len(missing_idx_list) == 0:
             return result
 
-        # Criar padrões de disponibilidade (tuple de índices disponíveis)
-        pattern_groups = {}
         for idx in missing_idx_list:
+            # Features disponíveis para este ponto
             avail_mask = ~data.loc[idx, feature_cols].isna()
-            avail_indices = tuple(np.where(avail_mask.values)[0])
+            avail_indices = np.where(avail_mask.values)[0]
             if len(avail_indices) == 0:
                 continue
-            if avail_indices not in pattern_groups:
-                pattern_groups[avail_indices] = []
-            pattern_groups[avail_indices].append(idx)
 
-        # Processar cada grupo em batch
-        for avail_indices, group_indices in pattern_groups.items():
-            avail_indices = list(avail_indices)
             available = [feature_cols[i] for i in avail_indices]
+            sample_scaled = scaled_data.loc[idx, available].values
+            sample_original = data.loc[idx, available].values
 
-            # Preparar dados dos donors para este padrão
+            # Subset dos dados de referência para features disponíveis
             X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
             X_ref_original_sub = X_ref_original[:, avail_indices]
 
             # Filtrar donors com NaN nas features disponíveis
             valid_donors_mask = ~np.isnan(X_ref_scaled_sub).any(axis=1)
+
+            # === FCM FILTERING: Limitar busca aos clusters relevantes ===
+            if use_fcm_filtering:
+                # Obter memberships do ponto query
+                query_full = scaled_data.loc[idx].values
+                query_memberships = self.fcm_index.get_memberships_for_point(query_full)
+
+                # Obter candidatos dos clusters relevantes
+                candidate_indices = self.fcm_index.get_candidate_donors(
+                    query_memberships, self.n_top_clusters
+                )
+
+                if len(candidate_indices) >= self.min_friends:
+                    # Criar máscara FCM directamente usando indexação numpy
+                    # ref_indices contém os índices globais dos donors
+                    # candidate_indices contém índices globais dos candidatos FCM
+                    candidate_set = set(candidate_indices)
+                    fcm_mask = np.array([i in candidate_set for i in ref_indices], dtype=bool)
+                    valid_donors_mask = valid_donors_mask & fcm_mask
+
             if valid_donors_mask.sum() < self.min_friends:
                 continue
 
@@ -301,8 +335,6 @@ class ISCAkCore:
             y_ref_valid = y_ref[valid_donors_mask]
 
             # Preparar pesos e masks para este subset
-            data_col_indices = [data.columns.get_loc(c) for c in available]
-            range_factors_sub = range_factors_full[data_col_indices]
             weights_sub = weights[avail_indices].copy()
             if weights_sub.sum() > 0:
                 weights_sub = weights_sub / weights_sub.sum()
@@ -315,65 +347,60 @@ class ISCAkCore:
             nominal_mask_sub = nominal_mask[avail_indices]
             has_categorical = binary_mask_sub.any() or nominal_mask_sub.any() or ordinal_mask_sub.any()
 
-            # Preparar matriz de queries
-            queries_scaled = scaled_data.loc[group_indices, available].values
-            queries_original = data.loc[group_indices, available].values
-
-            # Calcular distâncias em BATCH (n_queries x n_donors)
+            # Calcular distâncias
             if not has_categorical:
-                dist_matrix = weighted_euclidean_multi_query(queries_scaled, X_ref_valid, weights_sub)
+                distances = weighted_euclidean_batch(sample_scaled, X_ref_valid, weights_sub)
             else:
-                dist_matrix = mixed_distance_multi_query(
-                    queries_scaled, X_ref_valid,
-                    queries_original, X_ref_orig_valid,
+                data_col_indices = [data.columns.get_loc(c) for c in available]
+                range_factors_sub = range_factors_full[data_col_indices]
+                distances = range_normalized_mixed_distance(
+                    sample_scaled, X_ref_valid,
+                    sample_original, X_ref_orig_valid,
                     numeric_mask_sub, binary_mask_sub,
                     ordinal_mask_sub, nominal_mask_sub,
-                    weights_sub
+                    weights_sub, range_factors_sub
                 )
 
-            # Processar cada query do grupo
-            for q_idx, idx in enumerate(group_indices):
-                distances = dist_matrix[q_idx]
+            # Adaptive k
+            k = adaptive_k_hybrid(
+                distances, y_ref_valid,
+                min_k=self.min_friends, max_k=self.max_friends,
+                alpha=self.adaptive_k_alpha, is_categorical=is_target_categorical
+            )
+            k = min(k, len(distances))
+            if k == 0:
+                continue
 
-                # Adaptive k
-                k = adaptive_k_hybrid(
-                    distances, y_ref_valid,
-                    min_k=self.min_friends, max_k=self.max_friends,
-                    alpha=self.adaptive_k_alpha, is_categorical=is_target_categorical
-                )
-                k = min(k, len(distances))
-                if k == 0:
-                    continue
+            friend_idx = np.argpartition(distances, k-1)[:k] if k < len(distances) else np.arange(len(distances))
+            friend_values = y_ref_valid[friend_idx]
+            friend_distances = distances[friend_idx]
 
-                friend_idx = np.argpartition(distances, k-1)[:k] if k < len(distances) else np.arange(len(distances))
-                friend_values = y_ref_valid[friend_idx]
-                friend_distances = distances[friend_idx]
-
-                # Imputar valor
-                if is_target_categorical:
-                    if len(friend_values) == 1:
-                        result.loc[idx] = friend_values[0]
-                    else:
-                        weighted_votes = {}
-                        for val, dist in zip(friend_values, friend_distances):
-                            weight = 1 / (dist + 1e-6)
-                            weighted_votes[val] = weighted_votes.get(val, 0) + weight
-                        result.loc[idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
+            # Imputar valor
+            if is_target_categorical:
+                if len(friend_values) == 1:
+                    result.loc[idx] = friend_values[0]
                 else:
-                    if np.any(friend_distances < 1e-10):
-                        exact_mask = friend_distances < 1e-10
-                        result.loc[idx] = np.mean(friend_values[exact_mask])
-                    else:
-                        w = 1 / (friend_distances + 1e-6)
-                        w = w / w.sum()
-                        result.loc[idx] = np.average(friend_values, weights=w)
+                    weighted_votes = {}
+                    for val, dist in zip(friend_values, friend_distances):
+                        weight = 1 / (dist + 1e-6)
+                        weighted_votes[val] = weighted_votes.get(val, 0) + weight
+                    result.loc[idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
+            else:
+                if np.any(friend_distances < 1e-10):
+                    exact_mask = friend_distances < 1e-10
+                    result.loc[idx] = np.mean(friend_values[exact_mask])
+                else:
+                    w = 1 / (friend_distances + 1e-6)
+                    w = w / w.sum()
+                    result.loc[idx] = np.average(friend_values, weights=w)
 
         return result
 
     def _refine_column_mixed(self, original_data: pd.DataFrame, target_col: str,
                              scaled_complete_df: pd.DataFrame, refine_mask_col: pd.Series) -> pd.Series:
         """
-        Refina valores imputados usando batch processing.
+        Refina valores imputados.
+        Usa estrutura similar a _impute_column_mixed mas com dados originais.
         """
         original_complete_mask = ~original_data[target_col].isna()
         if original_complete_mask.sum() == 0:
@@ -399,25 +426,19 @@ class ISCAkCore:
                                 target_col in self.mixed_handler.nominal_cols or
                                 target_col in self.mixed_handler.ordinal_cols)
 
-        # === BATCH PROCESSING: Agrupar por padrão de disponibilidade ===
         refine_idx_list = refine_mask_col[refine_mask_col].index.tolist()
         if len(refine_idx_list) == 0:
             return refined
 
-        pattern_groups = {}
         for idx in refine_idx_list:
             avail_mask = ~original_data.loc[idx, feature_cols].isna()
-            avail_indices = tuple(np.where(avail_mask.values)[0])
+            avail_indices = np.where(avail_mask.values)[0]
             if len(avail_indices) == 0:
                 continue
-            if avail_indices not in pattern_groups:
-                pattern_groups[avail_indices] = []
-            pattern_groups[avail_indices].append(idx)
 
-        # Processar cada grupo em batch
-        for avail_indices, group_indices in pattern_groups.items():
-            avail_indices = list(avail_indices)
             available = [feature_cols[i] for i in avail_indices]
+            sample_scaled = scaled_complete_df.loc[idx, available].values
+            sample_original = original_data.loc[idx, available].values
 
             X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
             X_ref_original_sub = X_ref_original[:, avail_indices]
@@ -430,8 +451,6 @@ class ISCAkCore:
             X_ref_orig_valid = X_ref_original_sub[valid_donors_mask]
             y_ref_valid = y_ref[valid_donors_mask]
 
-            data_col_indices = [original_data.columns.get_loc(c) for c in available]
-            range_factors_sub = range_factors_full[data_col_indices]
             weights_sub = weights[avail_indices].copy()
             if weights_sub.sum() > 0:
                 weights_sub = weights_sub / weights_sub.sum()
@@ -444,53 +463,49 @@ class ISCAkCore:
             nominal_mask_sub = nominal_mask[avail_indices]
             has_categorical = binary_mask_sub.any() or nominal_mask_sub.any() or ordinal_mask_sub.any()
 
-            queries_scaled = scaled_complete_df.loc[group_indices, available].values
-            queries_original = original_data.loc[group_indices, available].values
-
             if not has_categorical:
-                dist_matrix = weighted_euclidean_multi_query(queries_scaled, X_ref_valid, weights_sub)
+                distances = weighted_euclidean_batch(sample_scaled, X_ref_valid, weights_sub)
             else:
-                dist_matrix = mixed_distance_multi_query(
-                    queries_scaled, X_ref_valid,
-                    queries_original, X_ref_orig_valid,
+                data_col_indices = [original_data.columns.get_loc(c) for c in available]
+                range_factors_sub = range_factors_full[data_col_indices]
+                distances = range_normalized_mixed_distance(
+                    sample_scaled, X_ref_valid,
+                    sample_original, X_ref_orig_valid,
                     numeric_mask_sub, binary_mask_sub,
                     ordinal_mask_sub, nominal_mask_sub,
-                    weights_sub
+                    weights_sub, range_factors_sub
                 )
 
-            for q_idx, idx in enumerate(group_indices):
-                distances = dist_matrix[q_idx]
+            k = adaptive_k_hybrid(
+                distances, y_ref_valid,
+                min_k=self.min_friends, max_k=self.max_friends,
+                alpha=self.adaptive_k_alpha, is_categorical=is_target_categorical
+            )
+            k = min(k, len(distances))
+            if k == 0:
+                continue
 
-                k = adaptive_k_hybrid(
-                    distances, y_ref_valid,
-                    min_k=self.min_friends, max_k=self.max_friends,
-                    alpha=self.adaptive_k_alpha, is_categorical=is_target_categorical
-                )
-                k = min(k, len(distances))
-                if k == 0:
-                    continue
+            friend_idx = np.argpartition(distances, k-1)[:k] if k < len(distances) else np.arange(len(distances))
+            friend_values = y_ref_valid[friend_idx]
+            friend_distances = distances[friend_idx]
 
-                friend_idx = np.argpartition(distances, k-1)[:k] if k < len(distances) else np.arange(len(distances))
-                friend_values = y_ref_valid[friend_idx]
-                friend_distances = distances[friend_idx]
-
-                if is_target_categorical:
-                    if len(friend_values) == 1:
-                        refined.loc[idx] = friend_values[0]
-                    else:
-                        weighted_votes = {}
-                        for val, dist in zip(friend_values, friend_distances):
-                            weight = 1 / (dist + 1e-6)
-                            weighted_votes[val] = weighted_votes.get(val, 0) + weight
-                        refined.loc[idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
+            if is_target_categorical:
+                if len(friend_values) == 1:
+                    refined.loc[idx] = friend_values[0]
                 else:
-                    if np.any(friend_distances < 1e-10):
-                        exact_mask = friend_distances < 1e-10
-                        refined.loc[idx] = np.mean(friend_values[exact_mask])
-                    else:
-                        w = 1 / (friend_distances + 1e-6)
-                        w = w / w.sum()
-                        refined.loc[idx] = np.average(friend_values, weights=w)
+                    weighted_votes = {}
+                    for val, dist in zip(friend_values, friend_distances):
+                        weight = 1 / (dist + 1e-6)
+                        weighted_votes[val] = weighted_votes.get(val, 0) + weight
+                    refined.loc[idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
+            else:
+                if np.any(friend_distances < 1e-10):
+                    exact_mask = friend_distances < 1e-10
+                    refined.loc[idx] = np.mean(friend_values[exact_mask])
+                else:
+                    w = 1 / (friend_distances + 1e-6)
+                    w = w / w.sum()
+                    refined.loc[idx] = np.average(friend_values, weights=w)
 
         return refined
 
@@ -504,6 +519,9 @@ class ISCAkCore:
         print(f"MI neighbors: {self.mi_neighbors}")
         print(f"Adaptive k alpha: {self.adaptive_k_alpha}")
         print(f"Fast mode: {self.fast_mode}")
+        print(f"FCM clustering: {self.use_fcm}")
+        if self.use_fcm:
+            print(f"  Clusters: {self.n_clusters}, Top: {self.n_top_clusters}")
         print(f"Max cycles: {self.max_cycles}")
         if self.mixed_handler.is_mixed:
             print(f"\nTipo dados: Misto")

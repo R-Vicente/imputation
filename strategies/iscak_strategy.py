@@ -27,8 +27,10 @@ class ISCAkStrategy(BaseStrategy):
         """
         import time
         from core.mi_calculator import calculate_mi_mixed
+        from core.fuzzy_clustering import FuzzyClusterIndex
 
         result = data_encoded.copy()
+        n_steps = 4 if imputer.use_fcm else 3
 
         if imputer.verbose:
             print(f"\n{'='*70}")
@@ -39,7 +41,7 @@ class ISCAkStrategy(BaseStrategy):
         scaled_data = imputer._get_scaled_data(result)
 
         if imputer.verbose:
-            print("[1/3] Calculando Informacao Mutua...")
+            print(f"[1/{n_steps}] Calculando Informacao Mutua...")
 
         imputer.mi_matrix = calculate_mi_mixed(
             data_encoded, scaled_data,
@@ -51,14 +53,37 @@ class ISCAkStrategy(BaseStrategy):
             fast_mode=imputer.fast_mode
         )
 
+        # Fit FCM-PDS para acelerar busca de vizinhos
+        if imputer.use_fcm:
+            if imputer.verbose:
+                print(f"[2/{n_steps}] Fitting Fuzzy C-Means (PDS)...")
+
+            # Ajustar n_clusters ao tamanho do dataset
+            n_samples = len(scaled_data)
+            effective_clusters = min(imputer.n_clusters, n_samples // 5)
+            effective_clusters = max(effective_clusters, 3)
+
+            imputer.fcm_index = FuzzyClusterIndex(
+                n_clusters=effective_clusters,
+                membership_threshold=imputer.fcm_membership_threshold,
+                verbose=False,
+                random_state=42
+            )
+            imputer.fcm_index.fit(scaled_data.values)
+
+            if imputer.verbose:
+                print(f"      {effective_clusters} clusters, sizes: {imputer.fcm_index.cluster_sizes}")
+
         if imputer.verbose:
-            print("[2/3] Ordenando colunas por facilidade...")
+            step = 3 if imputer.use_fcm else 2
+            print(f"[{step}/{n_steps}] Ordenando colunas por facilidade...")
 
         columns_ordered = imputer._rank_columns(result)
 
         if imputer.verbose:
             print(f"      Ordem: {', '.join(columns_ordered[:5])}{'...' if len(columns_ordered) > 5 else ''}")
-            print("[3/3] Imputando colunas...")
+            step = 4 if imputer.use_fcm else 3
+            print(f"[{step}/{n_steps}] Imputando colunas...")
 
         n_imputed_per_col = {}
         for col in columns_ordered:
