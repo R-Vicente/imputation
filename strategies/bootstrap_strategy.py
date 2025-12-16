@@ -58,7 +58,8 @@ class BootstrapStrategy(BaseStrategy):
                 imputer.mixed_handler.binary_cols,
                 imputer.mixed_handler.nominal_cols,
                 imputer.mixed_handler.ordinal_cols,
-                mi_neighbors=imputer.mi_neighbors
+                mi_neighbors=imputer.mi_neighbors,
+                fast_mode=imputer.fast_mode
             )
 
             columns_ordered = imputer._rank_columns(data_encoded)
