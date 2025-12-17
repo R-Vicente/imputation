@@ -115,37 +115,127 @@ class ISCAkCore:
 
     def _select_and_run_strategy(self, data_encoded, missing_mask,
                                   initial_missing, pct_complete_rows, start_time):
-        """Selecciona e executa a estratégia apropriada."""
+        """
+        Nova estratégia unificada:
+        1. Sempre tentar ISCA-k+PDS primeiro (funciona mesmo com poucas linhas completas)
+        2. Se restarem missings: aplicar IMR/Bootstrap como fallback
+        3. Refinar com ISCA-k
+        """
         from strategies.iscak_strategy import ISCAkStrategy
-        from strategies.imr_strategy import IMRStrategy
-        from strategies.bootstrap_strategy import BootstrapStrategy
 
         n_categorical = (len(self.mixed_handler.binary_cols) +
                         len(self.mixed_handler.nominal_cols) +
                         len(self.mixed_handler.ordinal_cols))
 
-        # DADOS PURAMENTE NUMÉRICOS
-        if n_categorical == 0:
-            if pct_complete_rows >= 5.0:
-                if self.verbose:
-                    print(f"Estratégia: ISCA-k puro (dados numéricos, >= 5% linhas completas)")
-                strategy = ISCAkStrategy()
+        if self.verbose:
+            if self.use_pds:
+                print(f"Estratégia: ISCA-k+PDS primeiro, fallback se necessário")
             else:
-                if self.verbose:
-                    print(f"Estratégia: IMR -> ISCA-k (dados numéricos, < 5% linhas completas)")
-                strategy = IMRStrategy()
-        # DADOS MISTOS OU PURAMENTE CATEGÓRICOS
-        else:
-            if pct_complete_rows >= 5.0:
-                if self.verbose:
-                    print(f"Estratégia: ISCA-k puro (dados mistos, >= 5% linhas completas)")
-                strategy = ISCAkStrategy()
-            else:
-                if self.verbose:
-                    print(f"Estratégia: Mediana/Moda -> ISCA-k (dados mistos, < 5% linhas completas)")
-                strategy = BootstrapStrategy()
+                print(f"Estratégia: ISCA-k clássico")
 
-        return strategy.run(self, data_encoded, missing_mask, initial_missing, start_time)
+        # FASE 1: Sempre tentar ISCA-k+PDS primeiro
+        strategy = ISCAkStrategy()
+        result = strategy.run(self, data_encoded, missing_mask, initial_missing, start_time)
+
+        # FASE 2: Se restarem missings, usar fallback
+        remaining = result.isna().sum().sum()
+        if remaining > 0:
+            if self.verbose:
+                print(f"\n{'='*70}")
+                print(f"FALLBACK: {remaining} missings restantes após ISCA-k+PDS")
+                print(f"{'='*70}")
+
+            if n_categorical == 0:
+                # Dados numéricos: usar IMR
+                result = self._apply_imr_fallback(result, data_encoded, start_time, initial_missing)
+            else:
+                # Dados mistos: usar mediana/moda
+                result = self._apply_bootstrap_fallback(result, data_encoded, start_time, initial_missing)
+
+        return result
+
+    def _apply_imr_fallback(self, result, original_data, start_time, initial_missing):
+        """Aplica IMR como fallback e refina com ISCA-k."""
+        import time
+        from imputers.imr_imputer import IMRInitializer
+
+        if self.verbose:
+            print("Aplicando IMR para preencher gaps...")
+
+        imr = IMRInitializer(n_iterations=5)
+        non_numeric = (self.mixed_handler.binary_cols +
+                      self.mixed_handler.nominal_cols +
+                      self.mixed_handler.ordinal_cols)
+        result = imr.fit_transform(result, self.mixed_handler.numeric_cols, non_numeric)
+
+        after_imr = result.isna().sum().sum()
+        if self.verbose:
+            print(f"Missings após IMR: {after_imr}")
+
+        if after_imr == 0:
+            # Refinar com ISCA-k
+            if self.verbose:
+                print("Refinando com ISCA-k...")
+            scaled_result = self._get_scaled_data(result, force_refit=True)
+            columns_ordered = self._rank_columns(original_data)
+            residual_mask = original_data.isna() & ~result.isna()
+
+            for col in columns_ordered:
+                if residual_mask[col].any():
+                    refined = self._refine_column_mixed(original_data, col, scaled_result, residual_mask[col])
+                    result.loc[residual_mask[col], col] = refined[residual_mask[col]]
+
+        end_time = time.time()
+        self.execution_stats = {
+            'initial_missing': initial_missing,
+            'final_missing': result.isna().sum().sum(),
+            'execution_time': end_time - start_time,
+            'strategy': 'ISCA-k+PDS → IMR → Refinamento',
+            'cycles': 1
+        }
+        if self.verbose:
+            self._print_summary()
+
+        return result
+
+    def _apply_bootstrap_fallback(self, result, original_data, start_time, initial_missing):
+        """Aplica mediana/moda como fallback e refina com ISCA-k."""
+        import time
+
+        if self.verbose:
+            print("Aplicando mediana/moda para preencher gaps...")
+
+        result = self._simple_bootstrap(result)
+
+        after_bootstrap = result.isna().sum().sum()
+        if self.verbose:
+            print(f"Missings após bootstrap: {after_bootstrap}")
+
+        if after_bootstrap == 0:
+            # Refinar com ISCA-k
+            if self.verbose:
+                print("Refinando com ISCA-k...")
+            scaled_result = self._get_scaled_data(result, force_refit=True)
+            columns_ordered = self._rank_columns(original_data)
+            residual_mask = original_data.isna() & ~result.isna()
+
+            for col in columns_ordered:
+                if residual_mask[col].any():
+                    refined = self._refine_column_mixed(original_data, col, scaled_result, residual_mask[col])
+                    result.loc[residual_mask[col], col] = refined[residual_mask[col]]
+
+        end_time = time.time()
+        self.execution_stats = {
+            'initial_missing': initial_missing,
+            'final_missing': result.isna().sum().sum(),
+            'execution_time': end_time - start_time,
+            'strategy': 'ISCA-k+PDS → Bootstrap → Refinamento',
+            'cycles': 1
+        }
+        if self.verbose:
+            self._print_summary()
+
+        return result
 
     def _simple_bootstrap(self, data: pd.DataFrame) -> pd.DataFrame:
         """
