@@ -2,6 +2,117 @@ import numpy as np
 from numba import jit, prange
 import warnings
 
+
+@jit(nopython=True, parallel=True, cache=True)
+def weighted_euclidean_pds(sample, reference_matrix, weights, min_overlap=3):
+    """
+    Distância euclidiana ponderada com Partial Distance Strategy.
+
+    Permite donors com overlap parcial - calcula distância só nas features
+    onde AMBOS (sample e donor) têm valores.
+
+    Args:
+        sample: Array (n_features,) - pode ter NaN
+        reference_matrix: Matriz (n_ref x n_features) - pode ter NaN
+        weights: Pesos por feature
+        min_overlap: Mínimo de features em comum
+
+    Returns:
+        distances: Array (n_ref,) - np.inf se overlap < min_overlap
+        n_shared: Array (n_ref,) - número de features partilhadas
+    """
+    n_ref = reference_matrix.shape[0]
+    n_features = len(sample)
+    distances = np.empty(n_ref)
+    n_shared = np.empty(n_ref, dtype=np.int64)
+
+    for i in prange(n_ref):
+        dist_sq = 0.0
+        weight_sum = 0.0
+        count = 0
+
+        for j in range(n_features):
+            # Só usa features onde AMBOS têm valores
+            if not np.isnan(sample[j]) and not np.isnan(reference_matrix[i, j]):
+                diff = sample[j] - reference_matrix[i, j]
+                dist_sq += weights[j] * diff * diff
+                weight_sum += weights[j]
+                count += 1
+
+        n_shared[i] = count
+
+        if count >= min_overlap and weight_sum > 0:
+            # Re-escala PDS: multiplica por n_total / n_shared
+            scale_factor = n_features / count
+            distances[i] = np.sqrt(dist_sq * scale_factor)
+        else:
+            distances[i] = np.inf
+
+    return distances, n_shared
+
+
+@jit(nopython=True, parallel=True, cache=True)
+def mixed_distance_pds(sample, reference_matrix,
+                       sample_original, reference_original,
+                       numeric_mask, binary_mask,
+                       ordinal_mask, nominal_mask,
+                       weights, range_factors, min_overlap=3):
+    """
+    Distância mista com Partial Distance Strategy.
+
+    Permite donors com overlap parcial.
+    """
+    n_ref = reference_matrix.shape[0]
+    n_features = len(sample)
+    distances = np.empty(n_ref)
+    n_shared = np.empty(n_ref, dtype=np.int64)
+
+    for i in prange(n_ref):
+        weighted_dist = 0.0
+        total_weight = 0.0
+        count = 0
+
+        for j in range(n_features):
+            # Só usa features onde AMBOS têm valores
+            s_val = sample[j]
+            r_val = reference_matrix[i, j]
+
+            if np.isnan(s_val) or np.isnan(r_val):
+                continue
+
+            count += 1
+            w = weights[j]
+
+            if numeric_mask[j]:
+                raw_diff = np.abs(s_val - r_val)
+                normalized_diff = raw_diff * range_factors[j]
+                if normalized_diff > 1.0:
+                    normalized_diff = 1.0
+                contrib = normalized_diff * w
+            elif ordinal_mask[j]:
+                contrib = np.abs(s_val - r_val) * w
+            elif binary_mask[j]:
+                contrib = 0.0 if s_val == r_val else w
+            elif nominal_mask[j]:
+                contrib = 0.0 if sample_original[j] == reference_original[i, j] else w
+            else:
+                contrib = 0.0
+
+            weighted_dist += contrib
+            total_weight += w
+
+        n_shared[i] = count
+
+        if count >= min_overlap and total_weight > 0:
+            # Re-escala PDS
+            scale_factor = n_features / count
+            distances[i] = (weighted_dist / total_weight) * scale_factor
+        else:
+            distances[i] = np.inf
+
+    return distances, n_shared
+
+
 @jit(nopython=True, parallel=True, cache=True)
 def weighted_euclidean_batch(sample, reference_matrix, weights):
     n_ref = reference_matrix.shape[0]
