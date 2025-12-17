@@ -34,14 +34,13 @@ class ISCAkStrategy(BaseStrategy):
 
         if imputer.verbose:
             print(f"\n{'='*70}")
-            print("FASE 1: ISCA-k PURO")
+            print("FASE 1: ISCA-k + PDS")
             print(f"{'='*70}")
-            print(f"Missings iniciais: {initial_missing}")
 
         scaled_data = imputer._get_scaled_data(result)
 
         if imputer.verbose:
-            print(f"[1/{n_steps}] Calculando Informacao Mutua...")
+            print(f"  [1/{n_steps}] Calculando Informacao Mutua...")
 
         imputer.mi_matrix = calculate_mi_mixed(
             data_encoded, scaled_data,
@@ -56,7 +55,7 @@ class ISCAkStrategy(BaseStrategy):
         # Fit FCM-PDS para acelerar busca de vizinhos
         if imputer.use_fcm:
             if imputer.verbose:
-                print(f"[2/{n_steps}] Fitting Fuzzy C-Means (PDS)...")
+                print(f"  [2/{n_steps}] Fitting Fuzzy C-Means...")
 
             # Ajustar n_clusters ao tamanho do dataset
             n_samples = len(scaled_data)
@@ -71,19 +70,15 @@ class ISCAkStrategy(BaseStrategy):
             )
             imputer.fcm_index.fit(scaled_data.values)
 
-            if imputer.verbose:
-                print(f"      {effective_clusters} clusters, sizes: {imputer.fcm_index.cluster_sizes}")
-
         if imputer.verbose:
             step = 3 if imputer.use_fcm else 2
-            print(f"[{step}/{n_steps}] Ordenando colunas por facilidade...")
+            print(f"  [{step}/{n_steps}] Ordenando colunas por facilidade...")
 
         columns_ordered = imputer._rank_columns(result)
 
         if imputer.verbose:
-            print(f"      Ordem: {', '.join(columns_ordered[:5])}{'...' if len(columns_ordered) > 5 else ''}")
             step = 4 if imputer.use_fcm else 3
-            print(f"[{step}/{n_steps}] Imputando colunas...")
+            print(f"  [{step}/{n_steps}] Imputando colunas...")
 
         n_imputed_per_col = {}
         for col in columns_ordered:
@@ -94,14 +89,14 @@ class ISCAkStrategy(BaseStrategy):
             n_after = result[col].isna().sum()
             n_imputed = n_before - n_after
             n_imputed_per_col[col] = n_imputed
-            if imputer.verbose and n_imputed > 0:
-                print(f"      {col}: {n_imputed}/{n_before} imputados")
 
         remaining_missing = result.isna().sum().sum()
         progress = initial_missing - remaining_missing
+        pct_progress = (progress / initial_missing * 100) if initial_missing > 0 else 0
 
         if imputer.verbose:
-            print(f"\nProgresso: -{progress} missings ({remaining_missing} restantes)")
+            print(f"\n  Resultado: {initial_missing} → {remaining_missing} missings")
+            print(f"             {progress} imputados ({pct_progress:.1f}%)")
 
         if remaining_missing == 0:
             end_time = time.time()
@@ -109,15 +104,18 @@ class ISCAkStrategy(BaseStrategy):
                 'initial_missing': initial_missing,
                 'final_missing': 0,
                 'execution_time': end_time - start_time,
-                'strategy': 'ISCA-k puro',
-                'cycles': 0
+                'strategy': 'ISCA-k+PDS',
+                'phases': [
+                    {'name': 'ISCA-k+PDS', 'before': initial_missing, 'after': 0}
+                ]
             }
             if imputer.verbose:
                 imputer._print_summary()
             return result
 
         # Se ainda há missings, trata residuais
+        phase1_stats = {'name': 'ISCA-k+PDS', 'before': initial_missing, 'after': remaining_missing}
         return imputer._handle_residuals_with_imr(
             result, remaining_missing, initial_missing,
-            columns_ordered, data_encoded, start_time, n_imputed_per_col
+            columns_ordered, data_encoded, start_time, n_imputed_per_col, phase1_stats
         )
