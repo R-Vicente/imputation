@@ -88,16 +88,24 @@ class ISCAkCore:
             verbose=self.verbose
         )
 
-        # Calcular min_overlap automático se não especificado
+        # Configurar PDS e min_overlap baseado no número de features
+        n_features = data_encoded.shape[1]
+
+        # PDS não funciona bem para datasets com poucas features
+        # porque a escala (n_total/n_shared) distorce as distâncias
+        if n_features <= 6 and self.use_pds:
+            self._effective_pds = False
+            if self.verbose:
+                print(f"  Nota: PDS desativado automaticamente ({n_features} features)")
+        else:
+            self._effective_pds = self.use_pds
+
+        # Calcular min_overlap automático se não especificado (só relevante se PDS ativo)
         if self._min_overlap_user is None:
-            n_features = data_encoded.shape[1]
             # Fórmula adaptativa:
-            # - Poucos features (<=6): 50% mas min de 2 (menos restritivo para evitar fallback)
             # - Médio (7-15): ~40% (equilíbrio)
             # - Muitos features (>15): 50% (mais restritivo para manter qualidade)
-            if n_features <= 6:
-                self.min_overlap = max(2, n_features // 2)
-            elif n_features <= 15:
+            if n_features <= 15:
                 self.min_overlap = max(3, int(n_features * 0.4))
             else:
                 self.min_overlap = max(5, int(n_features * 0.5))
@@ -137,7 +145,7 @@ class ISCAkCore:
                         len(self.mixed_handler.ordinal_cols))
 
         if self.verbose:
-            if self.use_pds:
+            if self._effective_pds:
                 print(f"Estratégia: ISCA-k+PDS primeiro, fallback se necessário")
             else:
                 print(f"Estratégia: ISCA-k clássico")
@@ -469,7 +477,7 @@ class ISCAkCore:
             sample_original = X_all_original[row_idx]
 
             # === MODO PDS: Permite donors com overlap parcial ===
-            if self.use_pds:
+            if self._effective_pds:
                 if not has_categorical:
                     distances, n_shared = weighted_euclidean_pds(
                         sample_scaled, X_ref_scaled, weights, self.min_overlap
@@ -702,8 +710,8 @@ class ISCAkCore:
         print(f"FCM clustering: {self.use_fcm}")
         if self.use_fcm:
             print(f"  Clusters: {self.n_clusters}, Top: {self.n_top_clusters}")
-        print(f"PDS (partial donors): {self.use_pds}")
-        if self.use_pds:
+        print(f"PDS (partial donors): {self._effective_pds}")
+        if self._effective_pds:
             print(f"  Min overlap: {self.min_overlap} features")
         print(f"Max cycles: {self.max_cycles}")
         if self.mixed_handler.is_mixed:
