@@ -115,9 +115,9 @@ class ISCAkStrategy(BaseStrategy):
                 imputer._print_summary()
             return result
 
-        # Se ainda há missings, trata residuais
+        # Se ainda há missings, trata residuais com modo iterativo
         phase1_stats = {'name': phase_name, 'before': initial_missing, 'after': remaining_missing}
-        return imputer._handle_residuals_with_imr(
+        return imputer._handle_residuals_iterative(
             result, remaining_missing, initial_missing,
             columns_ordered, data_encoded, start_time, n_imputed_per_col, phase1_stats
         )
