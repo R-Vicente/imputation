@@ -91,7 +91,16 @@ class ISCAkCore:
         # Calcular min_overlap automático se não especificado
         if self._min_overlap_user is None:
             n_features = data_encoded.shape[1]
-            self.min_overlap = max(3, n_features // 3)
+            # Fórmula adaptativa:
+            # - Poucos features (<=6): 50% mas min de 2 (menos restritivo para evitar fallback)
+            # - Médio (7-15): ~40% (equilíbrio)
+            # - Muitos features (>15): 50% (mais restritivo para manter qualidade)
+            if n_features <= 6:
+                self.min_overlap = max(2, n_features // 2)
+            elif n_features <= 15:
+                self.min_overlap = max(3, int(n_features * 0.4))
+            else:
+                self.min_overlap = max(5, int(n_features * 0.5))
         else:
             self.min_overlap = self._min_overlap_user
 
