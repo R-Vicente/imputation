@@ -150,20 +150,9 @@ class ISCAkCore:
             else:
                 print(f"Estratégia: ISCA-k clássico")
 
-        # FASE 1: Sempre tentar ISCA-k+PDS primeiro
+        # Executar estratégia ISCA-k (com modo iterativo para residuais)
         strategy = ISCAkStrategy()
         result = strategy.run(self, data_encoded, missing_mask, initial_missing, start_time)
-
-        # FASE 2: Se restarem missings, usar fallback (só acontece quando _handle_residuals não foi chamado)
-        remaining = result.isna().sum().sum()
-        if remaining > 0 and 'phases' not in self.execution_stats:
-            # Fallback direto (caso ISCAkStrategy não tenha usado _handle_residuals)
-            phase1_stats = {'name': 'ISCA-k+PDS', 'before': initial_missing, 'after': remaining}
-
-            if n_categorical == 0:
-                result = self._apply_imr_fallback(result, data_encoded, start_time, initial_missing, phase1_stats)
-            else:
-                result = self._apply_bootstrap_fallback(result, data_encoded, start_time, initial_missing, phase1_stats)
 
         return result
 
@@ -337,78 +326,259 @@ class ISCAkCore:
     def _compute_range_factors(self, data: pd.DataFrame, scaled_data: pd.DataFrame):
         return compute_range_factors(data, scaled_data, self.mixed_handler, verbose=False)
 
-    def _handle_residuals_with_imr(self, result, remaining_missing, initial_missing,
-                                   columns_ordered, original_data, start_time, prev_stats,
-                                   phase1_stats=None):
-        from imputers.imr_imputer import IMRInitializer
+    def _handle_residuals_iterative(self, result, remaining_missing, initial_missing,
+                                      columns_ordered, original_data, start_time, prev_stats,
+                                      phase1_stats=None):
+        """
+        Modo iterativo para tratar missings residuais.
 
+        Usa linhas completas/quase-completas como doadores para imputar
+        linhas com mais missings, progressivamente:
+        1. Usa linhas completas + linhas com ≤threshold missings como doadores
+        2. Imputa linhas que têm missings (todas, usando doadores válidos)
+        3. Dobra o threshold e repete
+        """
         phases = [phase1_stats] if phase1_stats else []
+        phase_name = "ISCA-k + PDS" if self._effective_pds else "ISCA-k"
 
         if self.verbose:
             print(f"\n{'='*70}")
-            print("FASE 2: Tratamento de Residuais")
+            print("FASE 2: Modo Iterativo")
             print(f"{'='*70}")
-            print(f"  Método: IMR + Refinamento ISCA-k")
-
-        cycle = 0
-        prev_progress = float('inf')
-        non_numeric_cols = (self.mixed_handler.binary_cols +
-                           self.mixed_handler.nominal_cols +
-                           self.mixed_handler.ordinal_cols)
+            print(f"  Método: {phase_name} com doadores progressivos")
 
         before_phase2 = remaining_missing
+        cycle = 0
+        threshold = 1  # Começa com doadores que têm ≤1 missing
+        stagnant_cycles = 0
+        max_stagnant = 2  # Para após 2 ciclos sem evolução
 
-        while remaining_missing > 0 and cycle < self.max_cycles:
+        while remaining_missing > 0 and cycle < self.max_cycles and stagnant_cycles < max_stagnant:
             cycle += 1
             before_cycle = remaining_missing
 
-            # IMR para preencher gaps
-            imr = IMRInitializer(n_iterations=3)
-            result = imr.fit_transform(
-                result,
-                self.mixed_handler.numeric_cols,
-                non_numeric_cols
-            )
-            after_imr = result.isna().sum().sum()
+            # Contar missings por linha
+            missings_per_row = result.isna().sum(axis=1)
 
-            if after_imr > 0:
-                if self.verbose:
-                    print(f"  Ciclo {cycle}: IMR não completou ({after_imr} restantes)")
-                break
+            # Doadores: linhas com poucos missings (serão usadas como referência)
+            donor_mask = missings_per_row <= threshold
+            n_donors = donor_mask.sum()
 
-            # Refinamento ISCA-k
-            scaled_result = self._get_scaled_data(result, force_refit=True)
-            residual_mask = original_data.isna() & ~result.isna()
-            n_refined = 0
-            for col in columns_ordered:
-                if residual_mask[col].any():
-                    refined = self._refine_column_mixed(original_data, col, scaled_result, residual_mask[col])
-                    result.loc[residual_mask[col], col] = refined[residual_mask[col]]
-                    n_refined += residual_mask[col].sum()
-
-            new_remaining = result.isna().sum().sum()
-            cycle_progress = remaining_missing - new_remaining
+            # Alvos: linhas que ainda têm missings
+            target_mask = missings_per_row > 0
+            n_targets = target_mask.sum()
 
             if self.verbose:
-                print(f"  Ciclo {cycle}: {before_cycle} → {new_remaining} ({cycle_progress} imputados, {n_refined} refinados)")
+                n_complete = (missings_per_row == 0).sum()
+                n_partial_donors = donor_mask.sum() - n_complete
+                print(f"\n  Ciclo {cycle}: doadores com ≤{threshold} missings")
+                print(f"    Doadores: {n_donors} ({n_complete} completas + {n_partial_donors} parciais)")
+                print(f"    Alvos: {n_targets} linhas com missings")
 
-            if cycle_progress == 0 or (cycle > 1 and cycle_progress < prev_progress * 0.1):
-                break
-            prev_progress = cycle_progress
+            if n_donors < self.min_friends:
+                if self.verbose:
+                    print(f"    Poucos doadores, aumentando threshold...")
+                threshold *= 2
+                continue
+
+            # Escalar dados completos para usar como referência
+            scaled_data = self._get_scaled_data(result, force_refit=True)
+
+            # Para cada coluna, imputar usando apenas doadores válidos
+            n_imputed_cycle = 0
+            for col in columns_ordered:
+                col_missing_mask = result[col].isna()
+                if not col_missing_mask.any():
+                    continue
+
+                # Doadores para esta coluna: doadores que têm esta coluna completa
+                col_donor_mask = donor_mask & ~col_missing_mask
+
+                if col_donor_mask.sum() < self.min_friends:
+                    continue
+
+                # Imputar valores usando apenas os doadores válidos
+                before_col = col_missing_mask.sum()
+                result[col] = self._impute_column_with_donors(
+                    result, col, scaled_data, col_donor_mask
+                )
+                after_col = result[col].isna().sum()
+                n_imputed_cycle += (before_col - after_col)
+
+            new_remaining = result.isna().sum().sum()
+            cycle_progress = before_cycle - new_remaining
+
+            if self.verbose:
+                print(f"    Imputados: {n_imputed_cycle}, Restantes: {new_remaining}")
+
+            if cycle_progress == 0:
+                stagnant_cycles += 1
+            else:
+                stagnant_cycles = 0
+
             remaining_missing = new_remaining
 
-        phases.append({'name': 'IMR+Refinamento', 'before': before_phase2, 'after': remaining_missing, 'cycles': cycle})
+            # Dobrar threshold para próximo ciclo
+            threshold *= 2
+
+        # Se ainda há missings, tentar fallback com mediana/moda
+        if remaining_missing > 0:
+            if self.verbose:
+                print(f"\n  Fallback: preenchendo {remaining_missing} missings restantes com mediana/moda")
+            result = self._simple_bootstrap(result)
+            remaining_missing = result.isna().sum().sum()
+
+        phases.append({
+            'name': f'Iterativo ({cycle} ciclos)',
+            'before': before_phase2,
+            'after': remaining_missing
+        })
 
         end_time = time.time()
+        strategy_name = f"{phase_name} → Iterativo"
+
         self.execution_stats = {
             'initial_missing': initial_missing,
             'final_missing': remaining_missing,
             'execution_time': end_time - start_time,
-            'strategy': 'ISCA-k+PDS → IMR+Refinamento',
+            'strategy': strategy_name,
             'phases': phases
         }
+
         if self.verbose:
             self._print_summary()
+
+        if remaining_missing > 0:
+            import warnings
+            warnings.warn(f"Imputação incompleta: {remaining_missing} valores não foram imputados")
+
+        return result
+
+    def _impute_column_with_donors(self, data: pd.DataFrame, target_col: str,
+                                    scaled_data: pd.DataFrame, donor_mask: pd.Series) -> pd.Series:
+        """
+        Imputa valores usando apenas doadores específicos (linhas marcadas em donor_mask).
+        """
+        result = data[target_col].copy()
+        missing_mask = data[target_col].isna()
+
+        if not missing_mask.any():
+            return result
+
+        # Referência: apenas doadores válidos
+        reference_data = data.loc[donor_mask]
+        reference_scaled = scaled_data.loc[donor_mask]
+
+        if len(reference_data) < self.min_friends:
+            return result
+
+        feature_cols = [c for c in data.columns if c != target_col]
+        mi_scores = self.mi_matrix.loc[feature_cols, target_col]
+        weights = mi_scores.values.astype(np.float64)
+        weights = weights / weights.sum() if weights.sum() > 0 else np.ones_like(weights) / len(weights)
+
+        range_factors_full = self._compute_range_factors(data, scaled_data)
+
+        numeric_mask = np.array([col in self.mixed_handler.numeric_cols for col in feature_cols], dtype=np.bool_)
+        binary_mask = np.array([col in self.mixed_handler.binary_cols for col in feature_cols], dtype=np.bool_)
+        ordinal_mask = np.array([col in self.mixed_handler.ordinal_cols for col in feature_cols], dtype=np.bool_)
+        nominal_mask = np.array([col in self.mixed_handler.nominal_cols for col in feature_cols], dtype=np.bool_)
+
+        has_categorical = nominal_mask.any() or binary_mask.any()
+        is_target_categorical = (target_col in self.mixed_handler.nominal_cols or
+                                  target_col in self.mixed_handler.binary_cols)
+
+        # Preparar arrays de referência
+        X_ref_scaled = reference_scaled[feature_cols].values.astype(np.float64)
+        X_ref_original = reference_data[feature_cols].values.astype(np.float64)
+        y_ref = reference_data[target_col].values
+
+        X_all_scaled = scaled_data[feature_cols].values.astype(np.float64)
+        X_all_original = data[feature_cols].values.astype(np.float64)
+
+        # Mapear range_factors para as feature_cols (excluindo target_col)
+        col_to_idx = {col: idx for idx, col in enumerate(data.columns)}
+        range_factors = np.array([range_factors_full[col_to_idx[col]] for col in feature_cols], dtype=np.float64)
+
+        missing_row_indices = np.where(missing_mask.values)[0]
+
+        for row_idx in missing_row_indices:
+            sample_scaled = X_all_scaled[row_idx]
+            sample_original = X_all_original[row_idx]
+
+            # Usar PDS ou método clássico dependendo da configuração
+            if self._effective_pds:
+                if not has_categorical:
+                    distances, n_shared = weighted_euclidean_pds(
+                        sample_scaled, X_ref_scaled, weights, self.min_overlap
+                    )
+                else:
+                    distances, n_shared = mixed_distance_pds(
+                        sample_scaled, X_ref_scaled,
+                        sample_original, X_ref_original,
+                        numeric_mask, binary_mask,
+                        ordinal_mask, nominal_mask,
+                        weights, range_factors, self.min_overlap
+                    )
+
+                valid_mask = np.isfinite(distances)
+                if valid_mask.sum() < self.min_friends:
+                    continue
+
+                distances_valid = distances[valid_mask]
+                y_ref_valid = y_ref[valid_mask]
+
+            else:
+                # Modo clássico: requer overlap completo
+                avail_mask = ~np.isnan(sample_scaled)
+                avail_indices = np.where(avail_mask)[0]
+
+                if len(avail_indices) < 2:
+                    continue
+
+                sample_scaled_sub = sample_scaled[avail_indices]
+                X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
+
+                valid_donors_mask = ~np.isnan(X_ref_scaled_sub).any(axis=1)
+                if valid_donors_mask.sum() < self.min_friends:
+                    continue
+
+                X_ref_valid = X_ref_scaled_sub[valid_donors_mask]
+                y_ref_valid = y_ref[valid_donors_mask]
+
+                weights_sub = weights[avail_indices].copy()
+                if weights_sub.sum() > 0:
+                    weights_sub = weights_sub / weights_sub.sum()
+                else:
+                    weights_sub = np.ones_like(weights_sub) / len(weights_sub)
+
+                distances_valid = weighted_euclidean_batch(
+                    sample_scaled_sub, X_ref_valid, weights_sub
+                )
+
+            # Selecionar k adaptativo
+            k = adaptive_k_hybrid(
+                distances_valid, y_ref_valid,
+                self.min_friends, self.max_friends, self.adaptive_k_alpha
+            )
+
+            k = min(k, len(distances_valid))
+            nearest_indices = np.argsort(distances_valid)[:k]
+            nearest_distances = distances_valid[nearest_indices]
+            nearest_values = y_ref_valid[nearest_indices]
+
+            # Calcular valor imputado
+            if is_target_categorical:
+                unique, counts = np.unique(nearest_values, return_counts=True)
+                result.iloc[row_idx] = unique[np.argmax(counts)]
+            else:
+                if nearest_distances.sum() > 0:
+                    inv_distances = 1.0 / (nearest_distances + 1e-10)
+                    weights_dist = inv_distances / inv_distances.sum()
+                    result.iloc[row_idx] = np.average(nearest_values, weights=weights_dist)
+                else:
+                    result.iloc[row_idx] = np.mean(nearest_values)
+
         return result
 
     def _rank_columns(self, data: pd.DataFrame) -> list:
