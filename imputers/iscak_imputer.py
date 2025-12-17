@@ -146,30 +146,32 @@ class ISCAkCore:
         strategy = ISCAkStrategy()
         result = strategy.run(self, data_encoded, missing_mask, initial_missing, start_time)
 
-        # FASE 2: Se restarem missings, usar fallback
+        # FASE 2: Se restarem missings, usar fallback (só acontece quando _handle_residuals não foi chamado)
         remaining = result.isna().sum().sum()
-        if remaining > 0:
-            if self.verbose:
-                print(f"\n{'='*70}")
-                print(f"FALLBACK: {remaining} missings restantes após ISCA-k+PDS")
-                print(f"{'='*70}")
+        if remaining > 0 and 'phases' not in self.execution_stats:
+            # Fallback direto (caso ISCAkStrategy não tenha usado _handle_residuals)
+            phase1_stats = {'name': 'ISCA-k+PDS', 'before': initial_missing, 'after': remaining}
 
             if n_categorical == 0:
-                # Dados numéricos: usar IMR
-                result = self._apply_imr_fallback(result, data_encoded, start_time, initial_missing)
+                result = self._apply_imr_fallback(result, data_encoded, start_time, initial_missing, phase1_stats)
             else:
-                # Dados mistos: usar mediana/moda
-                result = self._apply_bootstrap_fallback(result, data_encoded, start_time, initial_missing)
+                result = self._apply_bootstrap_fallback(result, data_encoded, start_time, initial_missing, phase1_stats)
 
         return result
 
-    def _apply_imr_fallback(self, result, original_data, start_time, initial_missing):
+    def _apply_imr_fallback(self, result, original_data, start_time, initial_missing, phase1_stats=None):
         """Aplica IMR como fallback e refina com ISCA-k."""
         import time
         from imputers.imr_imputer import IMRInitializer
 
+        phases = [phase1_stats] if phase1_stats else []
+        before_imr = result.isna().sum().sum()
+
         if self.verbose:
-            print("Aplicando IMR para preencher gaps...")
+            print(f"\n{'='*70}")
+            print("FASE 2: Fallback IMR")
+            print(f"{'='*70}")
+            print(f"  Método: IMR + Refinamento ISCA-k")
 
         imr = IMRInitializer(n_iterations=5)
         non_numeric = (self.mixed_handler.binary_cols +
@@ -178,13 +180,10 @@ class ISCAkCore:
         result = imr.fit_transform(result, self.mixed_handler.numeric_cols, non_numeric)
 
         after_imr = result.isna().sum().sum()
-        if self.verbose:
-            print(f"Missings após IMR: {after_imr}")
+        n_refined = 0
 
         if after_imr == 0:
             # Refinar com ISCA-k
-            if self.verbose:
-                print("Refinando com ISCA-k...")
             scaled_result = self._get_scaled_data(result, force_refit=True)
             columns_ordered = self._rank_columns(original_data)
             residual_mask = original_data.isna() & ~result.isna()
@@ -193,37 +192,50 @@ class ISCAkCore:
                 if residual_mask[col].any():
                     refined = self._refine_column_mixed(original_data, col, scaled_result, residual_mask[col])
                     result.loc[residual_mask[col], col] = refined[residual_mask[col]]
+                    n_refined += residual_mask[col].sum()
+
+        final_missing = result.isna().sum().sum()
+
+        if self.verbose:
+            print(f"  IMR: {before_imr} → {after_imr} ({before_imr - after_imr} preenchidos)")
+            if n_refined > 0:
+                print(f"  Refinamento: {n_refined} valores refinados")
+
+        phases.append({'name': 'IMR+Refinamento', 'before': before_imr, 'after': final_missing})
 
         end_time = time.time()
         self.execution_stats = {
             'initial_missing': initial_missing,
-            'final_missing': result.isna().sum().sum(),
+            'final_missing': final_missing,
             'execution_time': end_time - start_time,
-            'strategy': 'ISCA-k+PDS → IMR → Refinamento',
-            'cycles': 1
+            'strategy': 'ISCA-k+PDS → IMR+Refinamento',
+            'phases': phases
         }
         if self.verbose:
             self._print_summary()
 
         return result
 
-    def _apply_bootstrap_fallback(self, result, original_data, start_time, initial_missing):
+    def _apply_bootstrap_fallback(self, result, original_data, start_time, initial_missing, phase1_stats=None):
         """Aplica mediana/moda como fallback e refina com ISCA-k."""
         import time
 
+        phases = [phase1_stats] if phase1_stats else []
+        before_bootstrap = result.isna().sum().sum()
+
         if self.verbose:
-            print("Aplicando mediana/moda para preencher gaps...")
+            print(f"\n{'='*70}")
+            print("FASE 2: Fallback Bootstrap")
+            print(f"{'='*70}")
+            print(f"  Método: Mediana/Moda + Refinamento ISCA-k")
 
         result = self._simple_bootstrap(result)
 
         after_bootstrap = result.isna().sum().sum()
-        if self.verbose:
-            print(f"Missings após bootstrap: {after_bootstrap}")
+        n_refined = 0
 
         if after_bootstrap == 0:
             # Refinar com ISCA-k
-            if self.verbose:
-                print("Refinando com ISCA-k...")
             scaled_result = self._get_scaled_data(result, force_refit=True)
             columns_ordered = self._rank_columns(original_data)
             residual_mask = original_data.isna() & ~result.isna()
@@ -232,14 +244,24 @@ class ISCAkCore:
                 if residual_mask[col].any():
                     refined = self._refine_column_mixed(original_data, col, scaled_result, residual_mask[col])
                     result.loc[residual_mask[col], col] = refined[residual_mask[col]]
+                    n_refined += residual_mask[col].sum()
+
+        final_missing = result.isna().sum().sum()
+
+        if self.verbose:
+            print(f"  Bootstrap: {before_bootstrap} → {after_bootstrap} ({before_bootstrap - after_bootstrap} preenchidos)")
+            if n_refined > 0:
+                print(f"  Refinamento: {n_refined} valores refinados")
+
+        phases.append({'name': 'Bootstrap+Refinamento', 'before': before_bootstrap, 'after': final_missing})
 
         end_time = time.time()
         self.execution_stats = {
             'initial_missing': initial_missing,
-            'final_missing': result.isna().sum().sum(),
+            'final_missing': final_missing,
             'execution_time': end_time - start_time,
-            'strategy': 'ISCA-k+PDS → Bootstrap → Refinamento',
-            'cycles': 1
+            'strategy': 'ISCA-k+PDS → Bootstrap+Refinamento',
+            'phases': phases
         }
         if self.verbose:
             self._print_summary()
@@ -308,15 +330,31 @@ class ISCAkCore:
         return compute_range_factors(data, scaled_data, self.mixed_handler, verbose=False)
 
     def _handle_residuals_with_imr(self, result, remaining_missing, initial_missing,
-                                   columns_ordered, original_data, start_time, prev_stats):
+                                   columns_ordered, original_data, start_time, prev_stats,
+                                   phase1_stats=None):
         from imputers.imr_imputer import IMRInitializer
+
+        phases = [phase1_stats] if phase1_stats else []
+
+        if self.verbose:
+            print(f"\n{'='*70}")
+            print("FASE 2: Tratamento de Residuais")
+            print(f"{'='*70}")
+            print(f"  Método: IMR + Refinamento ISCA-k")
+
         cycle = 0
         prev_progress = float('inf')
         non_numeric_cols = (self.mixed_handler.binary_cols +
                            self.mixed_handler.nominal_cols +
                            self.mixed_handler.ordinal_cols)
+
+        before_phase2 = remaining_missing
+
         while remaining_missing > 0 and cycle < self.max_cycles:
             cycle += 1
+            before_cycle = remaining_missing
+
+            # IMR para preencher gaps
             imr = IMRInitializer(n_iterations=3)
             result = imr.fit_transform(
                 result,
@@ -324,26 +362,42 @@ class ISCAkCore:
                 non_numeric_cols
             )
             after_imr = result.isna().sum().sum()
+
             if after_imr > 0:
+                if self.verbose:
+                    print(f"  Ciclo {cycle}: IMR não completou ({after_imr} restantes)")
                 break
+
+            # Refinamento ISCA-k
             scaled_result = self._get_scaled_data(result, force_refit=True)
             residual_mask = original_data.isna() & ~result.isna()
+            n_refined = 0
             for col in columns_ordered:
                 if residual_mask[col].any():
                     refined = self._refine_column_mixed(original_data, col, scaled_result, residual_mask[col])
                     result.loc[residual_mask[col], col] = refined[residual_mask[col]]
+                    n_refined += residual_mask[col].sum()
+
             new_remaining = result.isna().sum().sum()
             cycle_progress = remaining_missing - new_remaining
+
+            if self.verbose:
+                print(f"  Ciclo {cycle}: {before_cycle} → {new_remaining} ({cycle_progress} imputados, {n_refined} refinados)")
+
             if cycle_progress == 0 or (cycle > 1 and cycle_progress < prev_progress * 0.1):
                 break
             prev_progress = cycle_progress
             remaining_missing = new_remaining
+
+        phases.append({'name': 'IMR+Refinamento', 'before': before_phase2, 'after': remaining_missing, 'cycles': cycle})
+
         end_time = time.time()
         self.execution_stats = {
             'initial_missing': initial_missing,
             'final_missing': remaining_missing,
             'execution_time': end_time - start_time,
-            'cycles': cycle
+            'strategy': 'ISCA-k+PDS → IMR+Refinamento',
+            'phases': phases
         }
         if self.verbose:
             self._print_summary()
@@ -662,18 +716,32 @@ class ISCAkCore:
     def _print_summary(self):
         stats = self.execution_stats
         print("\n" + "="*70)
-        print("RESULTADO")
+        print("RESULTADO FINAL")
         print("="*70)
-        print(f"Estrategia: {stats.get('strategy', 'N/A')}")
-        print(f"Inicial:  {stats['initial_missing']} missings")
-        print(f"Final:    {stats['final_missing']} missings")
+
+        # Mostrar resumo de cada fase
+        phases = stats.get('phases', [])
+        if phases:
+            print("Fases:")
+            for phase in phases:
+                before = phase['before']
+                after = phase['after']
+                imputados = before - after
+                pct = (imputados / before * 100) if before > 0 else 0
+                cycles_info = f" ({phase['cycles']} ciclos)" if 'cycles' in phase else ""
+                print(f"  {phase['name']}: {before} → {after} ({imputados} imputados, {pct:.1f}%){cycles_info}")
+
+        # Resumo geral
+        print(f"\nTotal: {stats['initial_missing']} → {stats['final_missing']} missings")
+
         if stats['final_missing'] == 0:
-            print("SUCESSO: Dataset 100% completo")
+            print("Status: SUCESSO - Dataset 100% completo")
         else:
-            print(f"ATENCAO: {stats['final_missing']} missings NAO foram imputados")
+            print(f"Status: INCOMPLETO - {stats['final_missing']} missings restantes")
+
         if stats['final_missing'] < stats['initial_missing']:
             taxa = (1 - stats['final_missing']/stats['initial_missing'])*100
-            print(f"Taxa:     {taxa:.1f}%")
-        print(f"Ciclos:   {stats.get('cycles', 0)}")
-        print(f"Tempo:    {stats['execution_time']:.2f}s")
+            print(f"Taxa de imputação: {taxa:.1f}%")
+
+        print(f"Tempo total: {stats['execution_time']:.2f}s")
         print("="*70 + "\n")
