@@ -251,15 +251,16 @@ class ISCAkCore:
     def _impute_column_mixed(self, data: pd.DataFrame, target_col: str, scaled_data: pd.DataFrame) -> pd.Series:
         """
         Imputa valores em falta para uma coluna.
-        Usa FCM-PDS para acelerar busca de vizinhos se activado.
+        Optimizado: converte para numpy antes do loop para evitar overhead pandas.
         """
         result = data[target_col].copy()
-        missing_indices = data[target_col].isna()
-        complete_mask = ~missing_indices
+        missing_mask = data[target_col].isna()
+        complete_mask = ~missing_mask
         if complete_mask.sum() == 0:
             return result
 
         feature_cols = [c for c in data.columns if c != target_col]
+        feature_col_indices = [data.columns.get_loc(c) for c in feature_cols]
         mi_scores = self.mi_matrix.loc[feature_cols, target_col]
         weights = mi_scores.values
         weights = weights / weights.sum() if weights.sum() > 0 else np.ones_like(weights) / len(weights)
@@ -270,59 +271,53 @@ class ISCAkCore:
         ordinal_mask = np.array([col in self.mixed_handler.ordinal_cols for col in feature_cols], dtype=np.bool_)
         nominal_mask = np.array([col in self.mixed_handler.nominal_cols for col in feature_cols], dtype=np.bool_)
 
-        # Dados de referência (donors com target completo)
+        # Converter para numpy ANTES do loop
+        complete_mask_arr = complete_mask.values
         X_ref_scaled = scaled_data.loc[complete_mask, feature_cols].values
         X_ref_original = data.loc[complete_mask, feature_cols].values
         y_ref = data.loc[complete_mask, target_col].values
-        ref_indices = np.where(complete_mask.values)[0]  # Índices originais dos donors
+        ref_indices = np.where(complete_mask_arr)[0]
+
+        X_all_scaled = scaled_data[feature_cols].values
+        X_all_original = data[feature_cols].values
+        X_all_scaled_full = scaled_data.values
 
         is_target_binary = target_col in self.mixed_handler.binary_cols
         is_target_nominal = target_col in self.mixed_handler.nominal_cols
         is_target_ordinal = target_col in self.mixed_handler.ordinal_cols
         is_target_categorical = is_target_binary or is_target_nominal or is_target_ordinal
 
-        # Verificar se usar FCM (só se temos muitos donors)
         use_fcm_filtering = (self.use_fcm and self.fcm_index is not None and
                             len(y_ref) > self.max_friends * 3)
 
-        # Processar cada missing value
-        missing_idx_list = data[missing_indices].index.tolist()
-        if len(missing_idx_list) == 0:
+        missing_row_indices = np.where(missing_mask.values)[0]
+        if len(missing_row_indices) == 0:
             return result
 
-        for idx in missing_idx_list:
-            # Features disponíveis para este ponto
-            avail_mask = ~data.loc[idx, feature_cols].isna()
-            avail_indices = np.where(avail_mask.values)[0]
+        result_values = result.values.copy()
+
+        for row_idx in missing_row_indices:
+            row_scaled = X_all_scaled[row_idx]
+            avail_mask = ~np.isnan(row_scaled)
+            avail_indices = np.where(avail_mask)[0]
             if len(avail_indices) == 0:
                 continue
 
-            available = [feature_cols[i] for i in avail_indices]
-            sample_scaled = scaled_data.loc[idx, available].values
-            sample_original = data.loc[idx, available].values
+            sample_scaled = row_scaled[avail_indices]
+            sample_original = X_all_original[row_idx, avail_indices]
 
-            # Subset dos dados de referência para features disponíveis
             X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
             X_ref_original_sub = X_ref_original[:, avail_indices]
 
-            # Filtrar donors com NaN nas features disponíveis
             valid_donors_mask = ~np.isnan(X_ref_scaled_sub).any(axis=1)
 
-            # === FCM FILTERING: Limitar busca aos clusters relevantes ===
             if use_fcm_filtering:
-                # Obter memberships do ponto query
-                query_full = scaled_data.loc[idx].values
+                query_full = X_all_scaled_full[row_idx]
                 query_memberships = self.fcm_index.get_memberships_for_point(query_full)
-
-                # Obter candidatos dos clusters relevantes
                 candidate_indices = self.fcm_index.get_candidate_donors(
                     query_memberships, self.n_top_clusters
                 )
-
                 if len(candidate_indices) >= self.min_friends:
-                    # Criar máscara FCM directamente usando indexação numpy
-                    # ref_indices contém os índices globais dos donors
-                    # candidate_indices contém índices globais dos candidatos FCM
                     candidate_set = set(candidate_indices)
                     fcm_mask = np.array([i in candidate_set for i in ref_indices], dtype=bool)
                     valid_donors_mask = valid_donors_mask & fcm_mask
@@ -334,7 +329,6 @@ class ISCAkCore:
             X_ref_orig_valid = X_ref_original_sub[valid_donors_mask]
             y_ref_valid = y_ref[valid_donors_mask]
 
-            # Preparar pesos e masks para este subset
             weights_sub = weights[avail_indices].copy()
             if weights_sub.sum() > 0:
                 weights_sub = weights_sub / weights_sub.sum()
@@ -347,12 +341,10 @@ class ISCAkCore:
             nominal_mask_sub = nominal_mask[avail_indices]
             has_categorical = binary_mask_sub.any() or nominal_mask_sub.any() or ordinal_mask_sub.any()
 
-            # Calcular distâncias
             if not has_categorical:
                 distances = weighted_euclidean_batch(sample_scaled, X_ref_valid, weights_sub)
             else:
-                data_col_indices = [data.columns.get_loc(c) for c in available]
-                range_factors_sub = range_factors_full[data_col_indices]
+                range_factors_sub = range_factors_full[feature_col_indices][avail_indices]
                 distances = range_normalized_mixed_distance(
                     sample_scaled, X_ref_valid,
                     sample_original, X_ref_orig_valid,
@@ -361,7 +353,6 @@ class ISCAkCore:
                     weights_sub, range_factors_sub
                 )
 
-            # Adaptive k
             k = adaptive_k_hybrid(
                 distances, y_ref_valid,
                 min_k=self.min_friends, max_k=self.max_friends,
@@ -375,38 +366,38 @@ class ISCAkCore:
             friend_values = y_ref_valid[friend_idx]
             friend_distances = distances[friend_idx]
 
-            # Imputar valor
             if is_target_categorical:
                 if len(friend_values) == 1:
-                    result.loc[idx] = friend_values[0]
+                    result_values[row_idx] = friend_values[0]
                 else:
                     weighted_votes = {}
                     for val, dist in zip(friend_values, friend_distances):
                         weight = 1 / (dist + 1e-6)
                         weighted_votes[val] = weighted_votes.get(val, 0) + weight
-                    result.loc[idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
+                    result_values[row_idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
             else:
                 if np.any(friend_distances < 1e-10):
                     exact_mask = friend_distances < 1e-10
-                    result.loc[idx] = np.mean(friend_values[exact_mask])
+                    result_values[row_idx] = np.mean(friend_values[exact_mask])
                 else:
                     w = 1 / (friend_distances + 1e-6)
                     w = w / w.sum()
-                    result.loc[idx] = np.average(friend_values, weights=w)
+                    result_values[row_idx] = np.average(friend_values, weights=w)
 
-        return result
+        return pd.Series(result_values, index=result.index, name=result.name)
 
     def _refine_column_mixed(self, original_data: pd.DataFrame, target_col: str,
                              scaled_complete_df: pd.DataFrame, refine_mask_col: pd.Series) -> pd.Series:
         """
         Refina valores imputados.
-        Usa estrutura similar a _impute_column_mixed mas com dados originais.
+        Optimizado: converte para numpy antes do loop para evitar overhead pandas.
         """
         original_complete_mask = ~original_data[target_col].isna()
         if original_complete_mask.sum() == 0:
             return pd.Series(np.nan, index=original_data.index)
 
         feature_cols = [c for c in original_data.columns if c != target_col]
+        feature_col_indices = [original_data.columns.get_loc(c) for c in feature_cols]
         mi_scores = self.mi_matrix.loc[feature_cols, target_col]
         weights = mi_scores.values
         weights = weights / weights.sum() if weights.sum() > 0 else np.ones_like(weights) / len(weights)
@@ -417,28 +408,35 @@ class ISCAkCore:
         ordinal_mask = np.array([col in self.mixed_handler.ordinal_cols for col in feature_cols], dtype=np.bool_)
         nominal_mask = np.array([col in self.mixed_handler.nominal_cols for col in feature_cols], dtype=np.bool_)
 
-        refined = pd.Series(np.nan, index=original_data.index)
+        # Converter para numpy ANTES do loop
         X_ref_scaled = scaled_complete_df.loc[original_complete_mask, feature_cols].values
         X_ref_original = original_data.loc[original_complete_mask, feature_cols].values
         y_ref = original_data.loc[original_complete_mask, target_col].values
+
+        X_all_scaled = scaled_complete_df[feature_cols].values
+        X_all_original = original_data[feature_cols].values
 
         is_target_categorical = (target_col in self.mixed_handler.binary_cols or
                                 target_col in self.mixed_handler.nominal_cols or
                                 target_col in self.mixed_handler.ordinal_cols)
 
-        refine_idx_list = refine_mask_col[refine_mask_col].index.tolist()
-        if len(refine_idx_list) == 0:
-            return refined
+        # Usar índices numéricos
+        refine_row_indices = np.where(refine_mask_col.values)[0]
+        if len(refine_row_indices) == 0:
+            return pd.Series(np.nan, index=original_data.index)
 
-        for idx in refine_idx_list:
-            avail_mask = ~original_data.loc[idx, feature_cols].isna()
-            avail_indices = np.where(avail_mask.values)[0]
+        # Array para resultados
+        refined_values = np.full(len(original_data), np.nan)
+
+        for row_idx in refine_row_indices:
+            row_scaled = X_all_scaled[row_idx]
+            avail_mask = ~np.isnan(row_scaled)
+            avail_indices = np.where(avail_mask)[0]
             if len(avail_indices) == 0:
                 continue
 
-            available = [feature_cols[i] for i in avail_indices]
-            sample_scaled = scaled_complete_df.loc[idx, available].values
-            sample_original = original_data.loc[idx, available].values
+            sample_scaled = row_scaled[avail_indices]
+            sample_original = X_all_original[row_idx, avail_indices]
 
             X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
             X_ref_original_sub = X_ref_original[:, avail_indices]
@@ -466,8 +464,7 @@ class ISCAkCore:
             if not has_categorical:
                 distances = weighted_euclidean_batch(sample_scaled, X_ref_valid, weights_sub)
             else:
-                data_col_indices = [original_data.columns.get_loc(c) for c in available]
-                range_factors_sub = range_factors_full[data_col_indices]
+                range_factors_sub = range_factors_full[feature_col_indices][avail_indices]
                 distances = range_normalized_mixed_distance(
                     sample_scaled, X_ref_valid,
                     sample_original, X_ref_orig_valid,
@@ -491,23 +488,23 @@ class ISCAkCore:
 
             if is_target_categorical:
                 if len(friend_values) == 1:
-                    refined.loc[idx] = friend_values[0]
+                    refined_values[row_idx] = friend_values[0]
                 else:
                     weighted_votes = {}
                     for val, dist in zip(friend_values, friend_distances):
                         weight = 1 / (dist + 1e-6)
                         weighted_votes[val] = weighted_votes.get(val, 0) + weight
-                    refined.loc[idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
+                    refined_values[row_idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
             else:
                 if np.any(friend_distances < 1e-10):
                     exact_mask = friend_distances < 1e-10
-                    refined.loc[idx] = np.mean(friend_values[exact_mask])
+                    refined_values[row_idx] = np.mean(friend_values[exact_mask])
                 else:
                     w = 1 / (friend_distances + 1e-6)
                     w = w / w.sum()
-                    refined.loc[idx] = np.average(friend_values, weights=w)
+                    refined_values[row_idx] = np.average(friend_values, weights=w)
 
-        return refined
+        return pd.Series(refined_values, index=original_data.index)
 
     def _print_header(self, data: pd.DataFrame):
         print("\n" + "="*70)
