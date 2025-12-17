@@ -32,9 +32,11 @@ class ISCAkStrategy(BaseStrategy):
         result = data_encoded.copy()
         n_steps = 4 if imputer.use_fcm else 3
 
+        phase_name = "ISCA-k + PDS" if imputer._effective_pds else "ISCA-k"
+
         if imputer.verbose:
             print(f"\n{'='*70}")
-            print("FASE 1: ISCA-k + PDS")
+            print(f"FASE 1: {phase_name}")
             print(f"{'='*70}")
 
         scaled_data = imputer._get_scaled_data(result)
@@ -104,9 +106,9 @@ class ISCAkStrategy(BaseStrategy):
                 'initial_missing': initial_missing,
                 'final_missing': 0,
                 'execution_time': end_time - start_time,
-                'strategy': 'ISCA-k+PDS',
+                'strategy': phase_name,
                 'phases': [
-                    {'name': 'ISCA-k+PDS', 'before': initial_missing, 'after': 0}
+                    {'name': phase_name, 'before': initial_missing, 'after': 0}
                 ]
             }
             if imputer.verbose:
@@ -114,7 +116,7 @@ class ISCAkStrategy(BaseStrategy):
             return result
 
         # Se ainda há missings, trata residuais
-        phase1_stats = {'name': 'ISCA-k+PDS', 'before': initial_missing, 'after': remaining_missing}
+        phase1_stats = {'name': phase_name, 'before': initial_missing, 'after': remaining_missing}
         return imputer._handle_residuals_with_imr(
             result, remaining_missing, initial_missing,
             columns_ordered, data_encoded, start_time, n_imputed_per_col, phase1_stats
