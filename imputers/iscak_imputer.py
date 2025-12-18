@@ -326,7 +326,7 @@ class ISCAkCore:
             print(f"\n{'='*70}")
             print("FASE 2: Modo Iterativo")
             print(f"{'='*70}")
-            print(f"  Método: {phase_name} (sem PDS, min 2 features)")
+            print(f"  Método: {phase_name} (sem PDS, min 1 feature)")
 
         before_phase2 = remaining_missing
         cycle = 0
@@ -473,8 +473,9 @@ class ISCAkCore:
         avail_mask = ~np.isnan(sample_features)
         n_avail = avail_mask.sum()
 
-        # Precisa de pelo menos 2 features para calcular distância
-        if n_avail < 2:
+        # Precisa de pelo menos 1 feature para calcular distância
+        # (consistente com _impute_column_mixed que permite n_avail >= 1)
+        if n_avail < 1:
             return None
 
         # Pesos MI
