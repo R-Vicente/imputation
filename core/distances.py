@@ -104,8 +104,9 @@ def mixed_distance_pds(sample, reference_matrix,
         n_shared[i] = count
 
         if count >= min_overlap and total_weight > 0:
-            # Re-escala PDS
-            scale_factor = n_features / count
+            # Re-escala PDS com sqrt para consistência com euclidiana
+            # sqrt é mais conservador e evita distorcer demais distâncias parciais
+            scale_factor = np.sqrt(n_features / count)
             distances[i] = (weighted_dist / total_weight) * scale_factor
         else:
             distances[i] = np.inf

@@ -91,24 +91,29 @@ class ISCAkCore:
         # Configurar PDS e min_overlap baseado no número de features
         n_features = data_encoded.shape[1]
 
-        # PDS não funciona bem para datasets com poucas features
-        # porque a escala (n_total/n_shared) distorce as distâncias
-        if n_features <= 6 and self.use_pds:
+        # PDS não funciona bem para datasets com poucas features (≤10)
+        # Testes mostram: DIABETES(10)→Clássico melhor, WINE(13)→PDS melhor
+        if n_features <= 10 and self.use_pds:
             self._effective_pds = False
             if self.verbose:
-                print(f"  Nota: PDS desativado automaticamente ({n_features} features)")
+                print(f"  Nota: PDS desativado automaticamente ({n_features} features ≤ 10)")
         else:
             self._effective_pds = self.use_pds
 
-        # Calcular min_overlap automático se não especificado (só relevante se PDS ativo)
+        # Calcular min_overlap automático se não especificado
         if self._min_overlap_user is None:
-            # Fórmula adaptativa:
-            # - Médio (7-15): ~40% (equilíbrio)
-            # - Muitos features (>15): 50% (mais restritivo para manter qualidade)
-            if n_features <= 15:
-                self.min_overlap = max(3, int(n_features * 0.4))
+            if not self._effective_pds:
+                # Modo clássico: min_overlap baixo porque não há escala PDS
+                # Precisa de pelo menos 2 features para calcular distância
+                self.min_overlap = 2
             else:
-                self.min_overlap = max(5, int(n_features * 0.5))
+                # Modo PDS: min_overlap mais alto para evitar escala agressiva
+                # - Médio (11-20): ~50% (equilíbrio entre qualidade e cobertura)
+                # - Muitos features (>20): 40% (mais permissivo para grandes datasets)
+                if n_features <= 20:
+                    self.min_overlap = max(4, int(n_features * 0.5))
+                else:
+                    self.min_overlap = max(6, int(n_features * 0.4))
         else:
             self.min_overlap = self._min_overlap_user
 
@@ -332,99 +337,112 @@ class ISCAkCore:
         """
         Modo iterativo para tratar missings residuais.
 
-        Usa linhas completas/quase-completas como doadores para imputar
-        linhas com mais missings, progressivamente:
-        1. Usa linhas completas + linhas com ≤threshold missings como doadores
-        2. Imputa linhas que têm missings (todas, usando doadores válidos)
-        3. Dobra o threshold e repete
+        Cria um subdataset que cresce progressivamente:
+        1. Começa com linhas completas
+        2. Adiciona linhas com poucos missings, imputa-as
+        3. Essas linhas ficam completas e são doadores para as próximas
+        4. Repete até processar todas as linhas
         """
         phases = [phase1_stats] if phase1_stats else []
-        phase_name = "ISCA-k + PDS" if self._effective_pds else "ISCA-k"
+        # Fase 2 usa sempre ISCA-k clássico (sem PDS) para lidar com linhas com muitos missings
+        phase_name = "ISCA-k clássico"
 
         if self.verbose:
             print(f"\n{'='*70}")
             print("FASE 2: Modo Iterativo")
             print(f"{'='*70}")
-            print(f"  Método: {phase_name} com doadores progressivos")
+            print(f"  Método: {phase_name} (sem PDS, min 2 features)")
 
         before_phase2 = remaining_missing
         cycle = 0
-        threshold = 1  # Começa com doadores que têm ≤1 missing
         stagnant_cycles = 0
-        max_stagnant = 2  # Para após 2 ciclos sem evolução
+        max_stagnant = 3
 
-        while remaining_missing > 0 and cycle < self.max_cycles and stagnant_cycles < max_stagnant:
+        # Contar missings por linha ATUAL
+        missings_per_row = result.isna().sum(axis=1)
+
+        # Índices ordenados por número de missings (menos primeiro)
+        sorted_indices = missings_per_row.sort_values().index.tolist()
+
+        # Subdataset começa com linhas completas
+        subdataset_idx = [idx for idx in sorted_indices if missings_per_row[idx] == 0]
+        pending_idx = [idx for idx in sorted_indices if missings_per_row[idx] > 0]
+
+        if self.verbose:
+            print(f"  Linhas completas: {len(subdataset_idx)}")
+            print(f"  Linhas pendentes: {len(pending_idx)}")
+
+        # Se não há linhas completas, usar as com menos missings como base
+        if len(subdataset_idx) < self.min_friends and pending_idx:
+            # Mover linhas com menos missings para o subdataset
+            needed = self.min_friends - len(subdataset_idx)
+            to_move = pending_idx[:needed]
+            subdataset_idx.extend(to_move)
+            pending_idx = pending_idx[needed:]
+            if self.verbose:
+                print(f"  Expandido subdataset para {len(subdataset_idx)} linhas")
+
+        # Processar linhas pendentes em lotes
+        batch_size = max(1, len(pending_idx) // 10)  # ~10 iterações
+        batch_size = min(batch_size, 50)  # Não mais que 50 por vez
+
+        while pending_idx and cycle < self.max_cycles * 3 and stagnant_cycles < max_stagnant:
             cycle += 1
-            before_cycle = remaining_missing
+            before_cycle = result.isna().sum().sum()
 
-            # Contar missings por linha
-            missings_per_row = result.isna().sum(axis=1)
-
-            # Doadores: linhas com poucos missings (serão usadas como referência)
-            donor_mask = missings_per_row <= threshold
-            n_donors = donor_mask.sum()
-
-            # Alvos: linhas que ainda têm missings
-            target_mask = missings_per_row > 0
-            n_targets = target_mask.sum()
+            # Pegar próximo lote de linhas a processar
+            current_batch = pending_idx[:batch_size]
+            pending_idx = pending_idx[batch_size:]
 
             if self.verbose:
-                n_complete = (missings_per_row == 0).sum()
-                n_partial_donors = donor_mask.sum() - n_complete
-                print(f"\n  Ciclo {cycle}: doadores com ≤{threshold} missings")
-                print(f"    Doadores: {n_donors} ({n_complete} completas + {n_partial_donors} parciais)")
-                print(f"    Alvos: {n_targets} linhas com missings")
+                print(f"\n  Ciclo {cycle}: processando {len(current_batch)} linhas")
+                print(f"    Subdataset: {len(subdataset_idx)} doadores")
 
-            if n_donors < self.min_friends:
+            # Criar subdataset com doadores actuais
+            subdataset = result.loc[subdataset_idx].copy()
+
+            if len(subdataset) < self.min_friends:
                 if self.verbose:
-                    print(f"    Poucos doadores, aumentando threshold...")
-                threshold *= 2
+                    print(f"    Poucos doadores, adicionando batch ao subdataset...")
+                subdataset_idx.extend(current_batch)
                 continue
 
-            # Escalar dados completos para usar como referência
-            scaled_data = self._get_scaled_data(result, force_refit=True)
+            # Escalar subdataset
+            scaled_sub = self._get_scaled_data(subdataset, force_refit=True)
 
-            # Para cada coluna, imputar usando apenas doadores válidos
-            n_imputed_cycle = 0
-            for col in columns_ordered:
-                col_missing_mask = result[col].isna()
-                if not col_missing_mask.any():
-                    continue
+            # Imputar cada linha do batch
+            n_imputed = 0
+            for idx in current_batch:
+                # Imputar valores missing desta linha usando o subdataset
+                for col in columns_ordered:
+                    if pd.isna(result.loc[idx, col]):
+                        imputed = self._impute_single_value_from_subdataset(
+                            result.loc[idx], col, subdataset, scaled_sub
+                        )
+                        if imputed is not None:
+                            result.loc[idx, col] = imputed
+                            n_imputed += 1
 
-                # Doadores para esta coluna: doadores que têm esta coluna completa
-                col_donor_mask = donor_mask & ~col_missing_mask
-
-                if col_donor_mask.sum() < self.min_friends:
-                    continue
-
-                # Imputar valores usando apenas os doadores válidos
-                before_col = col_missing_mask.sum()
-                result[col] = self._impute_column_with_donors(
-                    result, col, scaled_data, col_donor_mask
-                )
-                after_col = result[col].isna().sum()
-                n_imputed_cycle += (before_col - after_col)
+                # Adicionar ao subdataset (mesmo incompleta, pode ajudar)
+                subdataset_idx.append(idx)
 
             new_remaining = result.isna().sum().sum()
-            cycle_progress = before_cycle - new_remaining
+            progress = before_cycle - new_remaining
 
             if self.verbose:
-                print(f"    Imputados: {n_imputed_cycle}, Restantes: {new_remaining}")
+                print(f"    Imputados: {n_imputed}, Restantes: {new_remaining}")
 
-            if cycle_progress == 0:
+            if progress == 0:
                 stagnant_cycles += 1
             else:
                 stagnant_cycles = 0
 
             remaining_missing = new_remaining
 
-            # Dobrar threshold para próximo ciclo
-            threshold *= 2
-
-        # Se ainda há missings, tentar fallback com mediana/moda
+        # Se ainda há missings, fallback com mediana/moda
         if remaining_missing > 0:
             if self.verbose:
-                print(f"\n  Fallback: preenchendo {remaining_missing} missings restantes com mediana/moda")
+                print(f"\n  Fallback: preenchendo {remaining_missing} missings com mediana/moda")
             result = self._simple_bootstrap(result)
             remaining_missing = result.isna().sum().sum()
 
@@ -435,13 +453,11 @@ class ISCAkCore:
         })
 
         end_time = time.time()
-        strategy_name = f"{phase_name} → Iterativo"
-
         self.execution_stats = {
             'initial_missing': initial_missing,
             'final_missing': remaining_missing,
             'execution_time': end_time - start_time,
-            'strategy': strategy_name,
+            'strategy': f"{phase_name} → Iterativo",
             'phases': phases
         }
 
@@ -454,132 +470,93 @@ class ISCAkCore:
 
         return result
 
-    def _impute_column_with_donors(self, data: pd.DataFrame, target_col: str,
-                                    scaled_data: pd.DataFrame, donor_mask: pd.Series) -> pd.Series:
+    def _impute_single_value_from_subdataset(self, row_data, target_col, subdataset, scaled_sub):
         """
-        Imputa valores usando apenas doadores específicos (linhas marcadas em donor_mask).
+        Imputa um único valor usando o subdataset como doadores.
+
+        NOTA: Usa sempre modo clássico (sem PDS) porque na Fase 2 as linhas
+        residuais têm muitos missings e min_overlap do PDS seria muito restritivo.
+
+        Args:
+            row_data: Series com os dados da linha a imputar
+            target_col: Coluna a imputar
+            subdataset: DataFrame com linhas doadores
+            scaled_sub: DataFrame com dados escalados dos doadores
+
+        Returns:
+            Valor imputado ou None se não conseguir
         """
-        result = data[target_col].copy()
-        missing_mask = data[target_col].isna()
+        # Doadores válidos: têm o target preenchido
+        valid_donors = subdataset[~subdataset[target_col].isna()]
+        if len(valid_donors) < self.min_friends:
+            return None
 
-        if not missing_mask.any():
-            return result
+        feature_cols = [c for c in subdataset.columns if c != target_col]
 
-        # Referência: apenas doadores válidos
-        reference_data = data.loc[donor_mask]
-        reference_scaled = scaled_data.loc[donor_mask]
+        # Features disponíveis no sample (não-missing)
+        sample_features = row_data[feature_cols].values.astype(np.float64)
+        avail_mask = ~np.isnan(sample_features)
+        n_avail = avail_mask.sum()
 
-        if len(reference_data) < self.min_friends:
-            return result
+        # Precisa de pelo menos 2 features para calcular distância
+        if n_avail < 2:
+            return None
 
-        feature_cols = [c for c in data.columns if c != target_col]
+        # Pesos MI
         mi_scores = self.mi_matrix.loc[feature_cols, target_col]
         weights = mi_scores.values.astype(np.float64)
         weights = weights / weights.sum() if weights.sum() > 0 else np.ones_like(weights) / len(weights)
 
-        range_factors_full = self._compute_range_factors(data, scaled_data)
+        # Dados dos doadores (escalonados para distâncias)
+        donor_scaled = scaled_sub.loc[valid_donors.index, feature_cols].values.astype(np.float64)
+        donor_targets = valid_donors[target_col].values
 
-        numeric_mask = np.array([col in self.mixed_handler.numeric_cols for col in feature_cols], dtype=np.bool_)
-        binary_mask = np.array([col in self.mixed_handler.binary_cols for col in feature_cols], dtype=np.bool_)
-        ordinal_mask = np.array([col in self.mixed_handler.ordinal_cols for col in feature_cols], dtype=np.bool_)
-        nominal_mask = np.array([col in self.mixed_handler.nominal_cols for col in feature_cols], dtype=np.bool_)
+        # Modo clássico: usar apenas features onde o sample tem valores
+        # Os doadores do subdataset são linhas completas, então têm todas as features
+        avail_indices = np.where(avail_mask)[0]
 
-        has_categorical = nominal_mask.any() or binary_mask.any()
-        is_target_categorical = (target_col in self.mixed_handler.nominal_cols or
-                                  target_col in self.mixed_handler.binary_cols)
+        # Escalonar o sample também
+        sample_scaled = scaled_sub.loc[row_data.name, feature_cols].values.astype(np.float64) if row_data.name in scaled_sub.index else sample_features
+        sample_sub = sample_scaled[avail_indices]
+        donors_sub = donor_scaled[:, avail_indices]
 
-        # Preparar arrays de referência
-        X_ref_scaled = reference_scaled[feature_cols].values.astype(np.float64)
-        X_ref_original = reference_data[feature_cols].values.astype(np.float64)
-        y_ref = reference_data[target_col].values
+        # Filtrar doadores com todas essas features (devem ser todos se subdataset é completo)
+        valid_donors_mask = ~np.isnan(donors_sub).any(axis=1)
+        if valid_donors_mask.sum() < self.min_friends:
+            return None
 
-        X_all_scaled = scaled_data[feature_cols].values.astype(np.float64)
-        X_all_original = data[feature_cols].values.astype(np.float64)
+        donors_valid = donors_sub[valid_donors_mask]
+        targets_valid = donor_targets[valid_donors_mask]
 
-        # Mapear range_factors para as feature_cols (excluindo target_col)
-        col_to_idx = {col: idx for idx, col in enumerate(data.columns)}
-        range_factors = np.array([range_factors_full[col_to_idx[col]] for col in feature_cols], dtype=np.float64)
+        weights_sub = weights[avail_indices]
+        weights_sub = weights_sub / weights_sub.sum() if weights_sub.sum() > 0 else np.ones_like(weights_sub) / len(weights_sub)
 
-        missing_row_indices = np.where(missing_mask.values)[0]
+        distances_valid = weighted_euclidean_batch(sample_sub, donors_valid, weights_sub)
 
-        for row_idx in missing_row_indices:
-            sample_scaled = X_all_scaled[row_idx]
-            sample_original = X_all_original[row_idx]
+        # Selecionar k vizinhos
+        k = adaptive_k_hybrid(
+            distances_valid, targets_valid,
+            self.min_friends, self.max_friends, self.adaptive_k_alpha
+        )
+        k = min(k, len(distances_valid))
 
-            # Usar PDS ou método clássico dependendo da configuração
-            if self._effective_pds:
-                if not has_categorical:
-                    distances, n_shared = weighted_euclidean_pds(
-                        sample_scaled, X_ref_scaled, weights, self.min_overlap
-                    )
-                else:
-                    distances, n_shared = mixed_distance_pds(
-                        sample_scaled, X_ref_scaled,
-                        sample_original, X_ref_original,
-                        numeric_mask, binary_mask,
-                        ordinal_mask, nominal_mask,
-                        weights, range_factors, self.min_overlap
-                    )
+        nearest_idx = np.argsort(distances_valid)[:k]
+        nearest_dist = distances_valid[nearest_idx]
+        nearest_vals = targets_valid[nearest_idx]
 
-                valid_mask = np.isfinite(distances)
-                if valid_mask.sum() < self.min_friends:
-                    continue
+        # Calcular valor
+        is_categorical = (target_col in self.mixed_handler.nominal_cols or
+                         target_col in self.mixed_handler.binary_cols)
 
-                distances_valid = distances[valid_mask]
-                y_ref_valid = y_ref[valid_mask]
-
-            else:
-                # Modo clássico: requer overlap completo
-                avail_mask = ~np.isnan(sample_scaled)
-                avail_indices = np.where(avail_mask)[0]
-
-                if len(avail_indices) < 2:
-                    continue
-
-                sample_scaled_sub = sample_scaled[avail_indices]
-                X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
-
-                valid_donors_mask = ~np.isnan(X_ref_scaled_sub).any(axis=1)
-                if valid_donors_mask.sum() < self.min_friends:
-                    continue
-
-                X_ref_valid = X_ref_scaled_sub[valid_donors_mask]
-                y_ref_valid = y_ref[valid_donors_mask]
-
-                weights_sub = weights[avail_indices].copy()
-                if weights_sub.sum() > 0:
-                    weights_sub = weights_sub / weights_sub.sum()
-                else:
-                    weights_sub = np.ones_like(weights_sub) / len(weights_sub)
-
-                distances_valid = weighted_euclidean_batch(
-                    sample_scaled_sub, X_ref_valid, weights_sub
-                )
-
-            # Selecionar k adaptativo
-            k = adaptive_k_hybrid(
-                distances_valid, y_ref_valid,
-                self.min_friends, self.max_friends, self.adaptive_k_alpha
-            )
-
-            k = min(k, len(distances_valid))
-            nearest_indices = np.argsort(distances_valid)[:k]
-            nearest_distances = distances_valid[nearest_indices]
-            nearest_values = y_ref_valid[nearest_indices]
-
-            # Calcular valor imputado
-            if is_target_categorical:
-                unique, counts = np.unique(nearest_values, return_counts=True)
-                result.iloc[row_idx] = unique[np.argmax(counts)]
-            else:
-                if nearest_distances.sum() > 0:
-                    inv_distances = 1.0 / (nearest_distances + 1e-10)
-                    weights_dist = inv_distances / inv_distances.sum()
-                    result.iloc[row_idx] = np.average(nearest_values, weights=weights_dist)
-                else:
-                    result.iloc[row_idx] = np.mean(nearest_values)
-
-        return result
+        if is_categorical:
+            unique, counts = np.unique(nearest_vals, return_counts=True)
+            return unique[np.argmax(counts)]
+        else:
+            if nearest_dist.sum() > 0:
+                inv_dist = 1.0 / (nearest_dist + 1e-10)
+                w = inv_dist / inv_dist.sum()
+                return np.average(nearest_vals, weights=w)
+            return np.mean(nearest_vals)
 
     def _rank_columns(self, data: pd.DataFrame) -> list:
         scores = []
