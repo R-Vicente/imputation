@@ -88,34 +88,9 @@ class ISCAkCore:
             verbose=self.verbose
         )
 
-        # Configurar PDS e min_overlap baseado no número de features
-        n_features = data_encoded.shape[1]
-
-        # PDS não funciona bem para datasets com poucas features (≤10)
-        # Testes mostram: DIABETES(10)→Clássico melhor, WINE(13)→PDS melhor
-        if n_features <= 10 and self.use_pds:
-            self._effective_pds = False
-            if self.verbose:
-                print(f"  Nota: PDS desativado automaticamente ({n_features} features ≤ 10)")
-        else:
-            self._effective_pds = self.use_pds
-
-        # Calcular min_overlap automático se não especificado
-        if self._min_overlap_user is None:
-            if not self._effective_pds:
-                # Modo clássico: min_overlap baixo porque não há escala PDS
-                # Precisa de pelo menos 2 features para calcular distância
-                self.min_overlap = 2
-            else:
-                # Modo PDS: min_overlap mais alto para evitar escala agressiva
-                # - Médio (11-20): ~50% (equilíbrio entre qualidade e cobertura)
-                # - Muitos features (>20): 40% (mais permissivo para grandes datasets)
-                if n_features <= 20:
-                    self.min_overlap = max(4, int(n_features * 0.5))
-                else:
-                    self.min_overlap = max(6, int(n_features * 0.4))
-        else:
-            self.min_overlap = self._min_overlap_user
+        # PDS é controlado pelo parâmetro use_pds
+        # O overlap é adaptativo por valor (maximiza overlap, reduz se necessário)
+        self._effective_pds = self.use_pds
 
         missing_mask = data_encoded.isna()
         initial_missing = missing_mask.sum().sum()
@@ -575,10 +550,10 @@ class ISCAkCore:
         """
         Imputa valores em falta para uma coluna.
 
-        Quando use_pds=True: usa Partial Distance Strategy, permitindo donors
-        com overlap parcial (mais robusto para datasets com muitos missings).
-
-        Quando use_pds=False: requer que donors tenham todas as features do query.
+        Lógica:
+        - Se use_pds=True: tenta com overlap máximo, reduz até encontrar doadores
+        - Quando overlap=1 ou use_pds=False: usa modo clássico (sem escala PDS)
+        - Modo clássico funciona com qualquer nº de features disponíveis (>=1)
         """
         result = data[target_col].copy()
         missing_mask = data[target_col].isna()
@@ -587,6 +562,7 @@ class ISCAkCore:
             return result
 
         feature_cols = [c for c in data.columns if c != target_col]
+        n_features = len(feature_cols)
         mi_scores = self.mi_matrix.loc[feature_cols, target_col]
         weights = mi_scores.values.astype(np.float64)
         weights = weights / weights.sum() if weights.sum() > 0 else np.ones_like(weights) / len(weights)
@@ -602,15 +578,13 @@ class ISCAkCore:
         X_ref_scaled = scaled_data.loc[complete_mask, feature_cols].values.astype(np.float64)
         X_ref_original = data.loc[complete_mask, feature_cols].values.astype(np.float64)
         y_ref = data.loc[complete_mask, target_col].values
-        ref_indices = np.where(complete_mask.values)[0]
 
         X_all_scaled = scaled_data[feature_cols].values.astype(np.float64)
         X_all_original = data[feature_cols].values.astype(np.float64)
 
-        is_target_binary = target_col in self.mixed_handler.binary_cols
-        is_target_nominal = target_col in self.mixed_handler.nominal_cols
-        is_target_ordinal = target_col in self.mixed_handler.ordinal_cols
-        is_target_categorical = is_target_binary or is_target_nominal or is_target_ordinal
+        is_target_categorical = (target_col in self.mixed_handler.binary_cols or
+                                 target_col in self.mixed_handler.nominal_cols or
+                                 target_col in self.mixed_handler.ordinal_cols)
 
         missing_row_indices = np.where(missing_mask.values)[0]
         if len(missing_row_indices) == 0:
@@ -623,11 +597,25 @@ class ISCAkCore:
             sample_scaled = X_all_scaled[row_idx]
             sample_original = X_all_original[row_idx]
 
-            # === MODO PDS: Permite donors com overlap parcial ===
-            if self._effective_pds:
+            # Features disponíveis nesta linha
+            avail_mask = ~np.isnan(sample_scaled)
+            n_avail = avail_mask.sum()
+
+            if n_avail == 0:
+                # Sem features disponíveis, não consegue imputar
+                continue
+
+            imputed_value = None
+
+            # === MODO PDS ===
+            # min_overlap = 50% das features para evitar escala PDS agressiva
+            # Se não encontrar doadores, cai para modo clássico
+            min_pds_overlap = max(2, n_features // 2)
+
+            if self._effective_pds and n_avail >= min_pds_overlap:
                 if not has_categorical:
                     distances, n_shared = weighted_euclidean_pds(
-                        sample_scaled, X_ref_scaled, weights, self.min_overlap
+                        sample_scaled, X_ref_scaled, weights, min_pds_overlap
                     )
                 else:
                     distances, n_shared = mixed_distance_pds(
@@ -635,94 +623,98 @@ class ISCAkCore:
                         sample_original, X_ref_original,
                         numeric_mask, binary_mask,
                         ordinal_mask, nominal_mask,
-                        weights, range_factors, self.min_overlap
+                        weights, range_factors, min_pds_overlap
                     )
 
-                # Filtrar por overlap mínimo (distâncias infinitas)
                 valid_mask = np.isfinite(distances)
-                if valid_mask.sum() < self.min_friends:
-                    continue
+                if valid_mask.sum() >= self.min_friends:
+                    distances_valid = distances[valid_mask]
+                    y_ref_valid = y_ref[valid_mask]
+                    imputed_value = self._compute_imputed_value(
+                        distances_valid, y_ref_valid, is_target_categorical
+                    )
+                # Se não encontrar doadores suficientes, cai para modo clássico abaixo
 
-                distances_valid = distances[valid_mask]
-                y_ref_valid = y_ref[valid_mask]
-
-            # === MODO CLÁSSICO: Requer overlap completo ===
-            else:
-                avail_mask = ~np.isnan(sample_scaled)
+            # === MODO CLÁSSICO (sem PDS ou overlap=1) ===
+            if imputed_value is None and n_avail >= 1:
                 avail_indices = np.where(avail_mask)[0]
-                if len(avail_indices) < self.min_overlap:
-                    continue
-
                 sample_scaled_sub = sample_scaled[avail_indices]
                 sample_original_sub = sample_original[avail_indices]
                 X_ref_scaled_sub = X_ref_scaled[:, avail_indices]
                 X_ref_original_sub = X_ref_original[:, avail_indices]
 
+                # Doadores que têm todas as features disponíveis
                 valid_donors_mask = ~np.isnan(X_ref_scaled_sub).any(axis=1)
-                if valid_donors_mask.sum() < self.min_friends:
-                    continue
+                if valid_donors_mask.sum() >= self.min_friends:
+                    X_ref_valid = X_ref_scaled_sub[valid_donors_mask]
+                    X_ref_orig_valid = X_ref_original_sub[valid_donors_mask]
+                    y_ref_valid = y_ref[valid_donors_mask]
 
-                X_ref_valid = X_ref_scaled_sub[valid_donors_mask]
-                X_ref_orig_valid = X_ref_original_sub[valid_donors_mask]
-                y_ref_valid = y_ref[valid_donors_mask]
+                    weights_sub = weights[avail_indices].copy()
+                    if weights_sub.sum() > 0:
+                        weights_sub = weights_sub / weights_sub.sum()
+                    else:
+                        weights_sub = np.ones_like(weights_sub) / len(weights_sub)
 
-                weights_sub = weights[avail_indices].copy()
-                if weights_sub.sum() > 0:
-                    weights_sub = weights_sub / weights_sub.sum()
-                else:
-                    weights_sub = np.ones_like(weights_sub) / len(weights_sub)
+                    # Calcular distâncias sem escala PDS
+                    numeric_mask_sub = numeric_mask[avail_indices]
+                    binary_mask_sub = binary_mask[avail_indices]
+                    ordinal_mask_sub = ordinal_mask[avail_indices]
+                    nominal_mask_sub = nominal_mask[avail_indices]
+                    has_cat_sub = binary_mask_sub.any() or nominal_mask_sub.any() or ordinal_mask_sub.any()
 
-                numeric_mask_sub = numeric_mask[avail_indices]
-                binary_mask_sub = binary_mask[avail_indices]
-                ordinal_mask_sub = ordinal_mask[avail_indices]
-                nominal_mask_sub = nominal_mask[avail_indices]
-                has_cat_sub = binary_mask_sub.any() or nominal_mask_sub.any() or ordinal_mask_sub.any()
+                    if not has_cat_sub:
+                        distances_valid = weighted_euclidean_batch(sample_scaled_sub, X_ref_valid, weights_sub)
+                    else:
+                        range_factors_sub = range_factors[avail_indices]
+                        distances_valid = range_normalized_mixed_distance(
+                            sample_scaled_sub, X_ref_valid,
+                            sample_original_sub, X_ref_orig_valid,
+                            numeric_mask_sub, binary_mask_sub,
+                            ordinal_mask_sub, nominal_mask_sub,
+                            weights_sub, range_factors_sub
+                        )
 
-                if not has_cat_sub:
-                    distances_valid = weighted_euclidean_batch(sample_scaled_sub, X_ref_valid, weights_sub)
-                else:
-                    range_factors_sub = range_factors[avail_indices]
-                    distances_valid = range_normalized_mixed_distance(
-                        sample_scaled_sub, X_ref_valid,
-                        sample_original_sub, X_ref_orig_valid,
-                        numeric_mask_sub, binary_mask_sub,
-                        ordinal_mask_sub, nominal_mask_sub,
-                        weights_sub, range_factors_sub
+                    imputed_value = self._compute_imputed_value(
+                        distances_valid, y_ref_valid, is_target_categorical
                     )
 
-            # Adaptive k e imputação (comum aos dois modos)
-            k = adaptive_k_hybrid(
-                distances_valid, y_ref_valid,
-                min_k=self.min_friends, max_k=self.max_friends,
-                alpha=self.adaptive_k_alpha, is_categorical=is_target_categorical
-            )
-            k = min(k, len(distances_valid))
-            if k == 0:
-                continue
-
-            friend_idx = np.argpartition(distances_valid, k-1)[:k] if k < len(distances_valid) else np.arange(len(distances_valid))
-            friend_values = y_ref_valid[friend_idx]
-            friend_distances = distances_valid[friend_idx]
-
-            if is_target_categorical:
-                if len(friend_values) == 1:
-                    result_values[row_idx] = friend_values[0]
-                else:
-                    weighted_votes = {}
-                    for val, dist in zip(friend_values, friend_distances):
-                        weight = 1 / (dist + 1e-6)
-                        weighted_votes[val] = weighted_votes.get(val, 0) + weight
-                    result_values[row_idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
-            else:
-                if np.any(friend_distances < 1e-10):
-                    exact_mask = friend_distances < 1e-10
-                    result_values[row_idx] = np.mean(friend_values[exact_mask])
-                else:
-                    w = 1 / (friend_distances + 1e-6)
-                    w = w / w.sum()
-                    result_values[row_idx] = np.average(friend_values, weights=w)
+            if imputed_value is not None:
+                result_values[row_idx] = imputed_value
 
         return pd.Series(result_values, index=result.index, name=result.name)
+
+    def _compute_imputed_value(self, distances, y_values, is_categorical):
+        """Calcula o valor imputado baseado nos vizinhos mais próximos."""
+        k = adaptive_k_hybrid(
+            distances, y_values,
+            min_k=self.min_friends, max_k=self.max_friends,
+            alpha=self.adaptive_k_alpha, is_categorical=is_categorical
+        )
+        k = min(k, len(distances))
+        if k == 0:
+            return None
+
+        friend_idx = np.argpartition(distances, k-1)[:k] if k < len(distances) else np.arange(len(distances))
+        friend_values = y_values[friend_idx]
+        friend_distances = distances[friend_idx]
+
+        if is_categorical:
+            if len(friend_values) == 1:
+                return friend_values[0]
+            weighted_votes = {}
+            for val, dist in zip(friend_values, friend_distances):
+                weight = 1 / (dist + 1e-6)
+                weighted_votes[val] = weighted_votes.get(val, 0) + weight
+            return max(weighted_votes.items(), key=lambda x: x[1])[0]
+        else:
+            if np.any(friend_distances < 1e-10):
+                exact_mask = friend_distances < 1e-10
+                return np.mean(friend_values[exact_mask])
+            else:
+                w = 1 / (friend_distances + 1e-6)
+                w = w / w.sum()
+                return np.average(friend_values, weights=w)
 
     def _refine_column_mixed(self, original_data: pd.DataFrame, target_col: str,
                              scaled_complete_df: pd.DataFrame, refine_mask_col: pd.Series) -> pd.Series:
@@ -859,7 +851,7 @@ class ISCAkCore:
             print(f"  Clusters: {self.n_clusters}, Top: {self.n_top_clusters}")
         print(f"PDS (partial donors): {self._effective_pds}")
         if self._effective_pds:
-            print(f"  Min overlap: {self.min_overlap} features")
+            print(f"  Overlap: adaptativo (maximiza por valor)")
         print(f"Max cycles: {self.max_cycles}")
         if self.mixed_handler.is_mixed:
             print(f"\nTipo dados: Misto")
