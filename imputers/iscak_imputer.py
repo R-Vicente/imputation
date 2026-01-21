@@ -583,8 +583,20 @@ class ISCAkCore:
                          target_col in self.mixed_handler.binary_cols)
 
         if is_categorical:
-            unique, counts = np.unique(nearest_vals, return_counts=True)
-            return unique[np.argmax(counts)]
+            # Votos ponderados com tie-breaker por distância média
+            weighted_votes = {}
+            total_dist_per_class = {}
+            count_per_class = {}
+            for val, dist in zip(nearest_vals, nearest_dist):
+                weight = 1 / (dist + 1e-6)
+                weighted_votes[val] = weighted_votes.get(val, 0) + weight
+                total_dist_per_class[val] = total_dist_per_class.get(val, 0) + dist
+                count_per_class[val] = count_per_class.get(val, 0) + 1
+            sorted_classes = sorted(
+                weighted_votes.keys(),
+                key=lambda v: (-weighted_votes[v], total_dist_per_class[v] / count_per_class[v])
+            )
+            return sorted_classes[0]
         else:
             if nearest_dist.sum() > 0:
                 inv_dist = 1.0 / (nearest_dist + 1e-10)
@@ -761,11 +773,24 @@ class ISCAkCore:
         if is_categorical:
             if len(friend_values) == 1:
                 return friend_values[0]
+
+            # Contagem de votos ponderados e distâncias médias por classe
             weighted_votes = {}
+            total_dist_per_class = {}
+            count_per_class = {}
+
             for val, dist in zip(friend_values, friend_distances):
                 weight = 1 / (dist + 1e-6)
                 weighted_votes[val] = weighted_votes.get(val, 0) + weight
-            return max(weighted_votes.items(), key=lambda x: x[1])[0]
+                total_dist_per_class[val] = total_dist_per_class.get(val, 0) + dist
+                count_per_class[val] = count_per_class.get(val, 0) + 1
+
+            # Ordenar por voto (desc) e depois por distância média (asc) para desempate
+            sorted_classes = sorted(
+                weighted_votes.keys(),
+                key=lambda v: (-weighted_votes[v], total_dist_per_class[v] / count_per_class[v])
+            )
+            return sorted_classes[0]
         else:
             if np.any(friend_distances < 1e-10):
                 exact_mask = friend_distances < 1e-10
@@ -879,11 +904,20 @@ class ISCAkCore:
                 if len(friend_values) == 1:
                     refined_values[row_idx] = friend_values[0]
                 else:
+                    # Votos ponderados com tie-breaker por distância média
                     weighted_votes = {}
+                    total_dist_per_class = {}
+                    count_per_class = {}
                     for val, dist in zip(friend_values, friend_distances):
                         weight = 1 / (dist + 1e-6)
                         weighted_votes[val] = weighted_votes.get(val, 0) + weight
-                    refined_values[row_idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
+                        total_dist_per_class[val] = total_dist_per_class.get(val, 0) + dist
+                        count_per_class[val] = count_per_class.get(val, 0) + 1
+                    sorted_classes = sorted(
+                        weighted_votes.keys(),
+                        key=lambda v: (-weighted_votes[v], total_dist_per_class[v] / count_per_class[v])
+                    )
+                    refined_values[row_idx] = sorted_classes[0]
             else:
                 if np.any(friend_distances < 1e-10):
                     exact_mask = friend_distances < 1e-10
