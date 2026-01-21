@@ -473,10 +473,13 @@ class ISCAkCore:
             result = self._simple_bootstrap(result)
             remaining_missing = result.isna().sum().sum()
 
+        phase2_imputed = before_phase2 - remaining_missing
         phases.append({
             'name': f'Iterativo ({cycle} ciclos)',
             'before': before_phase2,
-            'after': remaining_missing
+            'after': remaining_missing,
+            'cycles': cycle,
+            'imputed': phase2_imputed
         })
 
         end_time = time.time()
@@ -485,7 +488,10 @@ class ISCAkCore:
             'final_missing': remaining_missing,
             'execution_time': end_time - start_time,
             'strategy': f"{phase_name} → Iterativo",
-            'phases': phases
+            'phases': phases,
+            'phase2_activated': True,
+            'phase2_cycles': cycle,
+            'phase2_imputed': phase2_imputed
         }
 
         if self.verbose:
@@ -577,8 +583,20 @@ class ISCAkCore:
                          target_col in self.mixed_handler.binary_cols)
 
         if is_categorical:
-            unique, counts = np.unique(nearest_vals, return_counts=True)
-            return unique[np.argmax(counts)]
+            # Votos ponderados com tie-breaker por distância média
+            weighted_votes = {}
+            total_dist_per_class = {}
+            count_per_class = {}
+            for val, dist in zip(nearest_vals, nearest_dist):
+                weight = 1 / (dist + 1e-6)
+                weighted_votes[val] = weighted_votes.get(val, 0) + weight
+                total_dist_per_class[val] = total_dist_per_class.get(val, 0) + dist
+                count_per_class[val] = count_per_class.get(val, 0) + 1
+            sorted_classes = sorted(
+                weighted_votes.keys(),
+                key=lambda v: (-weighted_votes[v], total_dist_per_class[v] / count_per_class[v])
+            )
+            return sorted_classes[0]
         else:
             if nearest_dist.sum() > 0:
                 inv_dist = 1.0 / (nearest_dist + 1e-10)
@@ -755,11 +773,24 @@ class ISCAkCore:
         if is_categorical:
             if len(friend_values) == 1:
                 return friend_values[0]
+
+            # Contagem de votos ponderados e distâncias médias por classe
             weighted_votes = {}
+            total_dist_per_class = {}
+            count_per_class = {}
+
             for val, dist in zip(friend_values, friend_distances):
                 weight = 1 / (dist + 1e-6)
                 weighted_votes[val] = weighted_votes.get(val, 0) + weight
-            return max(weighted_votes.items(), key=lambda x: x[1])[0]
+                total_dist_per_class[val] = total_dist_per_class.get(val, 0) + dist
+                count_per_class[val] = count_per_class.get(val, 0) + 1
+
+            # Ordenar por voto (desc) e depois por distância média (asc) para desempate
+            sorted_classes = sorted(
+                weighted_votes.keys(),
+                key=lambda v: (-weighted_votes[v], total_dist_per_class[v] / count_per_class[v])
+            )
+            return sorted_classes[0]
         else:
             if np.any(friend_distances < 1e-10):
                 exact_mask = friend_distances < 1e-10
@@ -873,11 +904,20 @@ class ISCAkCore:
                 if len(friend_values) == 1:
                     refined_values[row_idx] = friend_values[0]
                 else:
+                    # Votos ponderados com tie-breaker por distância média
                     weighted_votes = {}
+                    total_dist_per_class = {}
+                    count_per_class = {}
                     for val, dist in zip(friend_values, friend_distances):
                         weight = 1 / (dist + 1e-6)
                         weighted_votes[val] = weighted_votes.get(val, 0) + weight
-                    refined_values[row_idx] = max(weighted_votes.items(), key=lambda x: x[1])[0]
+                        total_dist_per_class[val] = total_dist_per_class.get(val, 0) + dist
+                        count_per_class[val] = count_per_class.get(val, 0) + 1
+                    sorted_classes = sorted(
+                        weighted_votes.keys(),
+                        key=lambda v: (-weighted_votes[v], total_dist_per_class[v] / count_per_class[v])
+                    )
+                    refined_values[row_idx] = sorted_classes[0]
             else:
                 if np.any(friend_distances < 1e-10):
                     exact_mask = friend_distances < 1e-10
@@ -936,6 +976,12 @@ class ISCAkCore:
                 pct = (imputados / before * 100) if before > 0 else 0
                 cycles_info = f" ({phase['cycles']} ciclos)" if 'cycles' in phase else ""
                 print(f"  {phase['name']}: {before} → {after} ({imputados} imputados, {pct:.1f}%){cycles_info}")
+
+        # Info sobre Fase 2
+        if stats.get('phase2_activated', False):
+            print(f"\n📊 Fase 2 activada: {stats['phase2_cycles']} ciclos, {stats['phase2_imputed']} valores imputados")
+        else:
+            print(f"\n✅ Fase 1 resolveu tudo (Fase 2 não necessária)")
 
         # Resumo geral
         print(f"\nTotal: {stats['initial_missing']} → {stats['final_missing']} missings")
