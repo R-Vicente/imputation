@@ -9,6 +9,7 @@ Método híbrido de imputação baseado em:
 import numpy as np
 import pandas as pd
 import time
+import warnings
 from pathlib import Path
 
 from preprocessing.type_detection import MixedDataHandler
@@ -75,9 +76,59 @@ class ISCAkCore:
                force_categorical: list = None,
                force_ordinal: dict = None,
                interactive: bool = True,
-               column_types_config: str = None) -> pd.DataFrame:
+               column_types_config: str = None,
+               delete_allblank: bool = True) -> pd.DataFrame:
+        """
+        Imputa valores em falta no dataset.
+
+        Args:
+            data: DataFrame com valores em falta
+            force_categorical: Lista de colunas a forçar como categóricas
+            force_ordinal: Dict de colunas ordinais com ordem dos valores
+            interactive: Se True, pergunta ao user sobre colunas ambíguas
+            column_types_config: Caminho para ficheiro JSON com configuração de tipos
+            delete_allblank: Se True, remove linhas 100% vazias antes da imputação.
+                            Se False, preenche-as com mediana/moda (fallback).
+
+        Returns:
+            DataFrame com valores imputados
+        """
         start_time = time.time()
         original_data = data.copy()
+
+        # === DETECTAR E TRATAR LINHAS 100% VAZIAS ===
+        allblank_mask = original_data.isna().all(axis=1)
+        n_allblank = allblank_mask.sum()
+        self._removed_allblank_indices = []  # Guardar para referência
+
+        if n_allblank > 0:
+            allblank_indices = original_data.index[allblank_mask].tolist()
+
+            if delete_allblank:
+                # Remover linhas e avisar
+                self._removed_allblank_indices = allblank_indices
+                warnings.warn(
+                    f"\n⚠️  {n_allblank} linha(s) removida(s) por estarem 100% vazias.\n"
+                    f"    Índices: {allblank_indices}\n"
+                    f"    Estas linhas não podem ser imputadas por métodos baseados em distância.",
+                    UserWarning
+                )
+                original_data = original_data[~allblank_mask].copy()
+
+                if self.verbose:
+                    print(f"\n⚠️  {n_allblank} linha(s) 100% vazia(s) removidas: {allblank_indices}")
+            else:
+                # Apenas avisar que vai usar fallback
+                warnings.warn(
+                    f"\n⚠️  {n_allblank} linha(s) estão 100% vazias.\n"
+                    f"    Índices: {allblank_indices}\n"
+                    f"    Serão preenchidas com mediana/moda (fallback).",
+                    UserWarning
+                )
+                if self.verbose:
+                    print(f"\n⚠️  {n_allblank} linha(s) 100% vazia(s) detectadas: {allblank_indices}")
+                    print(f"    Serão preenchidas com mediana/moda (fallback)")
+
         if column_types_config and Path(column_types_config).exists():
             force_categorical, force_ordinal = MixedDataHandler.load_config(column_types_config)
         data_encoded, self.encoding_info = self.mixed_handler.fit_transform(
@@ -97,9 +148,10 @@ class ISCAkCore:
         if self.verbose:
             self._print_header(data_encoded)
         complete_rows = (~missing_mask).all(axis=1).sum()
-        pct_complete_rows = complete_rows / len(data) * 100
+        n_rows = len(data_encoded)
+        pct_complete_rows = complete_rows / n_rows * 100
         if self.verbose:
-            print(f"\nLinhas 100% completas: {complete_rows}/{len(data)} ({pct_complete_rows:.1f}%)")
+            print(f"\nLinhas 100% completas: {complete_rows}/{n_rows} ({pct_complete_rows:.1f}%)")
 
         # Seleccionar e executar estratégia apropriada
         result_encoded = self._select_and_run_strategy(
@@ -867,10 +919,16 @@ class ISCAkCore:
         print("RESULTADO FINAL")
         print("="*70)
 
+        # Mostrar linhas removidas (se houver)
+        if hasattr(self, '_removed_allblank_indices') and self._removed_allblank_indices:
+            n_removed = len(self._removed_allblank_indices)
+            print(f"\n⚠️  Linhas 100% vazias removidas: {n_removed}")
+            print(f"    Índices: {self._removed_allblank_indices}")
+
         # Mostrar resumo de cada fase
         phases = stats.get('phases', [])
         if phases:
-            print("Fases:")
+            print("\nFases:")
             for phase in phases:
                 before = phase['before']
                 after = phase['after']
