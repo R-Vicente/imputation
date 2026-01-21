@@ -109,7 +109,10 @@ class ISCAkStrategy(BaseStrategy):
                 'strategy': phase_name,
                 'phases': [
                     {'name': phase_name, 'before': initial_missing, 'after': 0}
-                ]
+                ],
+                'phase2_activated': False,
+                'phase2_cycles': 0,
+                'phase2_imputed': 0
             }
             if imputer.verbose:
                 imputer._print_summary()

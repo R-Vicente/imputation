@@ -40,9 +40,15 @@ def compute_range_factors(data: pd.DataFrame, scaled_data: pd.DataFrame, mixed_h
                     if verbose:
                         print(f"  {col}: range=[{min_val:.2f}, {max_val:.2f}] = {empirical_range:.2f}")
                 else:
-                    range_factors[idx] = 1.0
+                    # Coluna constante: não contribui para distância (range_factor=0)
+                    range_factors[idx] = 0.0
+                    if verbose:
+                        print(f"  {col}: CONSTANTE (range_factor=0.0, ignorada)")
             else:
-                range_factors[idx] = 1.0
+                # Apenas 1 valor: não contribui para distância
+                range_factors[idx] = 0.0
+                if verbose:
+                    print(f"  {col}: APENAS 1 VALOR (range_factor=0.0, ignorada)")
         else:
             if verbose:
                 tipo = 'binary' if col in mixed_handler.binary_cols else 'ordinal' if col in mixed_handler.ordinal_cols else 'nominal'

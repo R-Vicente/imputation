@@ -473,10 +473,13 @@ class ISCAkCore:
             result = self._simple_bootstrap(result)
             remaining_missing = result.isna().sum().sum()
 
+        phase2_imputed = before_phase2 - remaining_missing
         phases.append({
             'name': f'Iterativo ({cycle} ciclos)',
             'before': before_phase2,
-            'after': remaining_missing
+            'after': remaining_missing,
+            'cycles': cycle,
+            'imputed': phase2_imputed
         })
 
         end_time = time.time()
@@ -485,7 +488,10 @@ class ISCAkCore:
             'final_missing': remaining_missing,
             'execution_time': end_time - start_time,
             'strategy': f"{phase_name} → Iterativo",
-            'phases': phases
+            'phases': phases,
+            'phase2_activated': True,
+            'phase2_cycles': cycle,
+            'phase2_imputed': phase2_imputed
         }
 
         if self.verbose:
@@ -936,6 +942,12 @@ class ISCAkCore:
                 pct = (imputados / before * 100) if before > 0 else 0
                 cycles_info = f" ({phase['cycles']} ciclos)" if 'cycles' in phase else ""
                 print(f"  {phase['name']}: {before} → {after} ({imputados} imputados, {pct:.1f}%){cycles_info}")
+
+        # Info sobre Fase 2
+        if stats.get('phase2_activated', False):
+            print(f"\n📊 Fase 2 activada: {stats['phase2_cycles']} ciclos, {stats['phase2_imputed']} valores imputados")
+        else:
+            print(f"\n✅ Fase 1 resolveu tudo (Fase 2 não necessária)")
 
         # Resumo geral
         print(f"\nTotal: {stats['initial_missing']} → {stats['final_missing']} missings")
