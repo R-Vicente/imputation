@@ -42,8 +42,14 @@ def weighted_euclidean_pds(sample, reference_matrix, weights, min_overlap=3):
         n_shared[i] = count
 
         if count >= min_overlap and weight_sum > 0:
-            # Re-escala PDS: multiplica por n_total / n_shared
-            scale_factor = n_features / count
+            # Adaptive PDS scaling (threshold=0.5):
+            # - overlap < 50%: linear scaling (penalização forte)
+            # - overlap >= 50%: sqrt scaling (penalização suave)
+            overlap_ratio = count / n_features
+            if overlap_ratio < 0.5:
+                scale_factor = n_features / count  # linear
+            else:
+                scale_factor = np.sqrt(n_features / count)  # sqrt
             distances[i] = np.sqrt(dist_sq * scale_factor)
         else:
             distances[i] = np.inf
@@ -105,9 +111,14 @@ def mixed_distance_pds(sample, reference_matrix,
         n_shared[i] = count
 
         if count >= min_overlap and total_weight > 0:
-            # Re-escala PDS com sqrt para consistência com euclidiana
-            # sqrt é mais conservador e evita distorcer demais distâncias parciais
-            scale_factor = np.sqrt(n_features / count)
+            # Adaptive PDS scaling (threshold=0.5):
+            # - overlap < 50%: linear scaling (penalização forte)
+            # - overlap >= 50%: sqrt scaling (penalização suave)
+            overlap_ratio = count / n_features
+            if overlap_ratio < 0.5:
+                scale_factor = n_features / count  # linear
+            else:
+                scale_factor = np.sqrt(n_features / count)  # sqrt
             distances[i] = (weighted_dist / total_weight) * scale_factor
         else:
             distances[i] = np.inf
